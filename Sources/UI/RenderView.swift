@@ -18,27 +18,44 @@ struct RenderView: View {
     @State private var renderTask: Task<Void, Never>?
     @State private var showPaywall = false
     @State private var showMaskEditor = false
-
-    private let player: AVPlayer
+    @State private var preview = TrailPreviewRenderer()
+    @State private var prepareTask: Task<Void, Never>?
 
     init(project: Project, sourceURL: URL) {
         self.project = project
         self.sourceURL = sourceURL
         _settings = State(initialValue: project.settings)
-        self.player = AVPlayer(url: sourceURL)
     }
 
-    private var speedSelection: Binding<Int> {
-        Binding(get: { max(1, Int(settings.outputSpeed.rounded())) },
-                set: { settings.outputSpeed = Double($0) })
+    /// Settings that change the per-frame mask and therefore need the preview re-prepared.
+    private var maskKey: [Double] {
+        [settings.sensitivity, settings.minMotionSize,
+         settings.stabilizationEnabled ? 1 : 0,
+         settings.backgroundMode == .slowUpdate ? 1 : 0]
     }
 
     var body: some View {
         Form {
-            Section("Source") {
-                VideoPlayer(player: player)
-                    .frame(height: 200)
+            Section {
+                trailPreview
                     .listRowInsets(EdgeInsets())
+            } footer: {
+                Text("Live preview of the final trail composition.")
+            }
+
+            Section("Trail frequency") {
+                VStack(alignment: .leading, spacing: 6) {
+                    Slider(value: $settings.trailFrequency, in: 0...1)
+                    HStack {
+                        Text("Sparse")
+                        Spacer()
+                        Text("Dense")
+                    }
+                    .font(.caption2)
+                    .foregroundStyle(.secondary)
+                    Text("How often a silhouette is snapshotted into the trail. Drag to see the density change above.")
+                        .font(.caption).foregroundStyle(.secondary)
+                }
             }
 
             Section("Trail settings") {
@@ -63,10 +80,6 @@ struct RenderView: View {
                         Text(aspect.label).tag(aspect)
                     }
                 }
-                Picker("Speed", selection: speedSelection) {
-                    ForEach(1...4, id: \.self) { Text("\($0)×").tag($0) }
-                }
-                .pickerStyle(.segmented)
             }
 
             Section {
@@ -140,13 +153,50 @@ struct RenderView: View {
         }
         .navigationTitle("Edit")
         .navigationBarTitleDisplayMode(.inline)
-        .onDisappear { renderTask?.cancel() }
+        .task { await preview.prepare(sourceURL: sourceURL, settings: settings) }
+        .onChange(of: settings.trailFrequency) { preview.recompose(settings: settings) }
+        .onChange(of: settings.trailMode) { preview.recompose(settings: settings) }
+        .onChange(of: maskKey) { schedulePrepare() }
+        .onChange(of: showMaskEditor) { _, presented in
+            // Re-prepare after editing ignore regions so the preview reflects them.
+            if !presented { schedulePrepare() }
+        }
+        .onDisappear { renderTask?.cancel(); prepareTask?.cancel() }
         .navigationDestination(item: $result) { ref in
             ResultView(resultURL: ref.url)
         }
         .sheet(isPresented: $showPaywall) { PaywallView() }
         .sheet(isPresented: $showMaskEditor) {
             MaskEditorView(sourceURL: sourceURL, regions: $settings.ignoreRegions)
+        }
+    }
+
+    @ViewBuilder
+    private var trailPreview: some View {
+        ZStack {
+            Color.black
+            if let image = preview.previewImage {
+                Image(decorative: image, scale: 1, orientation: .up)
+                    .resizable()
+                    .scaledToFit()
+            }
+            if preview.isPreparing || (preview.previewImage == nil && !preview.isReady) {
+                ProgressView("Preparing preview…").tint(.white)
+            }
+        }
+        .frame(height: 260)
+        .frame(maxWidth: .infinity)
+        .clipShape(RoundedRectangle(cornerRadius: 12))
+    }
+
+    private func schedulePrepare() {
+        prepareTask?.cancel()
+        let url = sourceURL
+        let settings = settings
+        prepareTask = Task {
+            try? await Task.sleep(nanoseconds: 400_000_000)
+            if Task.isCancelled { return }
+            await preview.prepare(sourceURL: url, settings: settings)
         }
     }
 

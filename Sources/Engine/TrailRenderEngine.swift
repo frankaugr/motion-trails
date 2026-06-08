@@ -44,6 +44,8 @@ struct TrailRenderEngine {
         try writer.start()
 
         let context = SharedRender.ciContext
+        let workingColorSpace = context.workingColorSpace ?? CGColorSpaceCreateDeviceRGB()
+        let flattener = PixelBufferFlattener(size: fullSize, colorSpace: workingColorSpace)
         let maskBuilder = MotionMaskBuilder()
         let compositor = TrailCompositor()
         let watermarkImage: CIImage? = watermark ? WatermarkRenderer().makeWatermark(outputSize: outputSize) : nil
@@ -57,14 +59,18 @@ struct TrailRenderEngine {
         var dynamicBackground = staticBackground
 
         let registrar = settings.stabilizationEnabled ? FrameRegistrar(reference: staticBackground) : nil
-        let stride = max(1, Int(settings.outputSpeed.rounded()))
 
-        let estimatedOutputFrames = max(1, info.estimatedFrameCount / stride)
+        // Trail frequency → how many evenly-spaced snapshots leave a *persistent* silhouette in
+        // the trail. The live subject is still drawn on top of every frame, so motion stays smooth
+        // regardless of frequency; only the permanence of the trail changes.
+        let snapshotCount = settings.snapshotCount(forFrameCount: info.estimatedFrameCount)
+
+        let total = max(1, info.estimatedFrameCount)
         var written = 0
-        var sourceIndex = 0
+        var processedIndex = 0
         var sawBright = false
-        var accumulator = staticBackground
-        var ageMap = CIImage(color: CIColor(red: 0, green: 0, blue: 0)).cropped(to: fullRect)  // age 0
+        var accumulator = staticBackground   // persistent trail (subject colors)
+        var ageMap = CIImage(color: CIColor(red: 0, green: 0, blue: 0)).cropped(to: fullRect)  // persistent recency
 
         // Seed the output with the clean background as frame 0.
         if output == .trail {
@@ -75,52 +81,56 @@ struct TrailRenderEngine {
 
         while let raw = try reader.nextFrame() {
             try Task.checkCancellation()
-            defer { sourceIndex += 1 }
             let frame = raw.cropped(to: fullRect)
 
             if !sawBright {
                 if BackgroundEstimator.meanLuma(frame, rect: fullRect, context: context) < 0.06 { continue }
                 sawBright = true
             }
-            guard sourceIndex % stride == 0 else { continue }
+            defer { processedIndex += 1 }
+            // ~`snapshotCount` evenly-spaced frames leave a permanent mark.
+            let isSnapshot = processedIndex == 0 ||
+                Int(Double(processedIndex) * Double(snapshotCount) / Double(total)) >
+                Int(Double(processedIndex - 1) * Double(snapshotCount) / Double(total))
 
             let aligned = (registrar?.align(frame) ?? frame).cropped(to: fullRect)
             let backgroundForMask = slowUpdate ? dynamicBackground : staticBackground
             let rawMask = maskBuilder.makeMask(current: aligned, background: backgroundForMask, settings: settings)
-
-            // Coverage (grayscale) with ignore regions removed; rebuild the alpha mask from it.
             var coverage = alphaToGray(rawMask, rect: fullRect)
-            if let keepMask {
-                coverage = multiply(coverage, keepMask, rect: fullRect)
-            }
+            if let keepMask { coverage = multiply(coverage, keepMask, rect: fullRect) }
             let mask = maskToAlpha(coverage)
 
             switch output {
             case .trail:
-                accumulator = flatten(compositor.compose(current: aligned, over: accumulator, mask: mask,
-                                                          mode: settings.trailMode), rect: fullRect, context: context)
-                // Age map: fresh where motion, decaying elsewhere.
-                ageMap = flatten(maximum(coverage, scaleGray(ageMap, decay), rect: fullRect),
-                                 rect: fullRect, context: context)
+                // Fade the persistent trail every frame for smooth decay.
+                if decay < 1 { ageMap = flattener.flatten(scaleGray(ageMap, decay), rect: fullRect, context: context) }
 
-                let trailColor = colorizer?.colorize(ageMap) ?? accumulator
+                // Display = persistent trail + the current (live) subject on top → smooth motion.
+                let displayAccumulator = compositor.compose(current: aligned, over: accumulator, mask: mask, mode: settings.trailMode)
+                let displayAgeMap = maximum(coverage, ageMap, rect: fullRect)
+                let trailColor = colorizer?.colorize(displayAgeMap) ?? displayAccumulator
                 let displayed = blendWithMask(foreground: trailColor, background: staticBackground,
-                                              maskAlpha: maskToAlpha(ageMap), rect: fullRect)
+                                              maskAlpha: maskToAlpha(displayAgeMap), rect: fullRect)
                 let exportFrame = prepareExport(displayed, cropRect: cropRect, scale: exportScale,
                                                 outputRect: outputRect, watermark: watermarkImage)
                 try await writer.append(exportFrame, context: context)
+
+                // Persist the silhouette only at snapshot frames.
+                if isSnapshot {
+                    accumulator = flattener.flatten(displayAccumulator, rect: fullRect, context: context)
+                    ageMap = flattener.flatten(displayAgeMap, rect: fullRect, context: context)
+                    if slowUpdate {
+                        dynamicBackground = updateBackground(dynamicBackground, with: aligned, mask: mask, rect: fullRect, flattener: flattener, context: context)
+                    }
+                }
             case .mask:
-                let exportFrame = prepareExport(mask.cropped(to: fullRect), cropRect: cropRect, scale: exportScale,
-                                                outputRect: outputRect, watermark: nil)
+                let exportFrame = prepareExport(mask.cropped(to: fullRect), cropRect: cropRect,
+                                                scale: exportScale, outputRect: outputRect, watermark: nil)
                 try await writer.append(exportFrame, context: context)
             }
 
-            if slowUpdate {
-                dynamicBackground = updateBackground(dynamicBackground, with: aligned, mask: mask, rect: fullRect, context: context)
-            }
-
             written += 1
-            progress?(min(1, Double(written) / Double(estimatedOutputFrames)))
+            progress?(min(1, Double(written) / Double(total)))
         }
 
         await writer.finish()
@@ -154,11 +164,6 @@ struct TrailRenderEngine {
     }
 
     // MARK: - Image helpers
-
-    private func flatten(_ image: CIImage, rect: CGRect, context: CIContext) -> CIImage {
-        if let cg = context.createCGImage(image, from: rect) { return CIImage(cgImage: cg) }
-        return image
-    }
 
     /// Moves the alpha (motion coverage) into an opaque grayscale image.
     private func alphaToGray(_ image: CIImage, rect: CGRect) -> CIImage {
@@ -214,10 +219,10 @@ struct TrailRenderEngine {
     }
 
     private func updateBackground(_ background: CIImage, with current: CIImage, mask: CIImage,
-                                  rect: CGRect, context: CIContext) -> CIImage {
+                                  rect: CGRect, flattener: PixelBufferFlattener, context: CIContext) -> CIImage {
         let mixed = setAlpha(current, 0.05).composited(over: background)
         let updated = blendWithMask(foreground: background, background: mixed, maskAlpha: mask, rect: rect)
-        return flatten(updated, rect: rect, context: context)
+        return flattener.flatten(updated, rect: rect, context: context)
     }
 
     private func setAlpha(_ image: CIImage, _ alpha: CGFloat) -> CIImage {

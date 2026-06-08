@@ -50,21 +50,28 @@ struct BackgroundEstimator {
                            format: .RGBA8, colorSpace: colorSpace)
         }
 
-        // Per-pixel, per-channel median across the sampled frames.
+        // Per-pixel, per-channel median across the sampled frames. The rows are independent and
+        // each writes a disjoint slice of `output`, so the work is fanned out across cores with
+        // `concurrentPerform` — the median is the single biggest one-time cost before the first
+        // frame renders, and it's embarrassingly parallel.
         var output = [UInt8](repeating: 0, count: rowBytes * height)
         let mid = n / 2
-        var scratch = [UInt8](repeating: 0, count: n)
-        let pixelCount = width * height
 
         output.withUnsafeMutableBufferPointer { out in
-            for p in 0..<pixelCount {
-                let base = p * 4
-                for c in 0..<3 {
-                    for k in 0..<n { scratch[k] = samples[k][base + c] }
-                    scratch.sort()
-                    out[base + c] = scratch[mid]
+            // Each iteration writes a disjoint row slice, so sharing the base pointer is safe.
+            nonisolated(unsafe) let outBase = out.baseAddress!
+            DispatchQueue.concurrentPerform(iterations: height) { row in
+                var scratch = [UInt8](repeating: 0, count: n)
+                let rowStart = row * rowBytes
+                for x in 0..<width {
+                    let base = rowStart + x * 4
+                    for c in 0..<3 {
+                        for k in 0..<n { scratch[k] = samples[k][base + c] }
+                        scratch.sort()
+                        outBase[base + c] = scratch[mid]
+                    }
+                    outBase[base + 3] = 255
                 }
-                out[base + 3] = 255
             }
         }
 

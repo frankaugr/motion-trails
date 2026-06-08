@@ -26,8 +26,9 @@ struct RenderSettings: Equatable, Hashable, Codable {
     /// Social crop/aspect applied to the export, after processing (spec §7.6, §11.1).
     var cropAspect: CropAspect = .original
 
-    /// Playback speed of the accumulated trail (spec §7.5). 1.0 = real time; >1 builds faster.
-    var outputSpeed: Double = 1.0
+    /// 0…1 trail frequency: how often a moving subject's silhouette is snapshotted into the
+    /// trail (spec §7.5). Higher = more frequent snapshots = denser trail; lower spaces them out.
+    var trailFrequency: Double = 1.0
 
     /// Output frame rate (spec §23 default 30).
     var outputFPS: Int = 30
@@ -143,4 +144,41 @@ struct RenderSettings: Equatable, Hashable, Codable {
         1.0 - min(max(fadeAmount, 0), 1) * 0.1   // fadeAmount 0 → 1.0, 1 → 0.90
     }
 
+    /// Number of evenly-spaced snapshots to composite into the trail, derived from `trailFrequency`.
+    /// Both the engine render and the live preview use this so their densities match.
+    func snapshotCount(forFrameCount frameCount: Int) -> Int {
+        let maxSnaps = min(48, max(1, frameCount))   // matches the live preview's layer cache
+        let minSnaps = min(2, maxSnaps)
+        let f = min(max(trailFrequency, 0), 1)
+        return max(1, Int((Double(minSnaps) + Double(maxSnaps - minSnaps) * f).rounded()))
+    }
+}
+
+// MARK: - Schema-tolerant decoding
+
+/// Custom `Decodable` so stored project manifests survive settings being added or removed across
+/// versions (missing keys fall back to defaults; unknown keys like a removed `outputSpeed` are
+/// ignored). `Encodable` and the memberwise initializer stay synthesized.
+extension RenderSettings {
+    enum CodingKeys: String, CodingKey {
+        case sensitivity, minMotionSize, stabilizationEnabled, backgroundMode, cropAspect
+        case trailMode, fadeAmount, colorStyle, ignoreRegions, trailFrequency, outputFPS
+    }
+
+    init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        var s = RenderSettings()
+        s.sensitivity = try c.decodeIfPresent(Double.self, forKey: .sensitivity) ?? s.sensitivity
+        s.minMotionSize = try c.decodeIfPresent(Double.self, forKey: .minMotionSize) ?? s.minMotionSize
+        s.stabilizationEnabled = try c.decodeIfPresent(Bool.self, forKey: .stabilizationEnabled) ?? s.stabilizationEnabled
+        s.backgroundMode = try c.decodeIfPresent(BackgroundMode.self, forKey: .backgroundMode) ?? s.backgroundMode
+        s.cropAspect = try c.decodeIfPresent(CropAspect.self, forKey: .cropAspect) ?? s.cropAspect
+        s.trailMode = try c.decodeIfPresent(TrailMode.self, forKey: .trailMode) ?? s.trailMode
+        s.fadeAmount = try c.decodeIfPresent(Double.self, forKey: .fadeAmount) ?? s.fadeAmount
+        s.colorStyle = try c.decodeIfPresent(ColorStyle.self, forKey: .colorStyle) ?? s.colorStyle
+        s.ignoreRegions = try c.decodeIfPresent([CGRect].self, forKey: .ignoreRegions) ?? s.ignoreRegions
+        s.trailFrequency = try c.decodeIfPresent(Double.self, forKey: .trailFrequency) ?? s.trailFrequency
+        s.outputFPS = try c.decodeIfPresent(Int.self, forKey: .outputFPS) ?? s.outputFPS
+        self = s
+    }
 }

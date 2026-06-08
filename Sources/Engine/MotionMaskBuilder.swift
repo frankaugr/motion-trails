@@ -7,7 +7,11 @@ import CoreImage.CIFilterBuiltins
 /// consumes during compositing.
 struct MotionMaskBuilder {
 
-    func makeMask(current: CIImage, background: CIImage, settings: RenderSettings) -> CIImage {
+    /// - Parameter radiusScale: multiplies the morphology radius so the mask can be built at a
+    ///   downscaled proxy resolution (the live preview) while keeping the same effective feature
+    ///   size as the full-resolution render. Leave at 1 for full-resolution masking.
+    func makeMask(current: CIImage, background: CIImage, settings: RenderSettings,
+                  radiusScale: CGFloat = 1) -> CIImage {
         let extent = current.extent
 
         // 1) Per-channel |current - background|. Difference *blend* (not absolute-difference)
@@ -29,7 +33,7 @@ struct MotionMaskBuilder {
         threshold.threshold = Float(settings.differenceThreshold)
 
         // 4) Opening (erode -> dilate) removes speckle and sub-minimum regions.
-        let radius = Float(settings.morphologyRadius)
+        let radius = max(0.5, Float(settings.morphologyRadius) * Float(radiusScale))
         let opened = dilate(erode(threshold.outputImage, radius: radius), radius: radius)
 
         // 5) Closing (dilate -> erode) fills small holes inside the subject.
