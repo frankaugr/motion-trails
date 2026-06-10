@@ -37,7 +37,15 @@ final class MonetizationStore {
     /// Whether premium creative effects (fade/blend, color, ignore masks) are available.
     var premiumEffectsUnlocked: Bool { isPremium }
 
+    /// Whether importing an existing clip from the photo library is available (spec §8).
+    /// Free tier captures in-app (length-capped); importing arbitrary footage is premium.
+    var videoImportUnlocked: Bool { isPremium }
+
     // MARK: - Purchase (stub)
+
+    /// Display price for the premium unlock. Stubbed; a StoreKit 2 implementation replaces this
+    /// with `Product.displayPrice` so the paywall shows the localized store price.
+    let displayPrice = "$6.99"
 
     /// Unlocks premium. Replace with a StoreKit 2 `Product.purchase()` + entitlement check.
     func purchasePremium() { isPremium = true }

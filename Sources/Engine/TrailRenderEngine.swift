@@ -17,13 +17,25 @@ struct TrailRenderEngine {
         case mask
     }
 
+    /// Coarse phase of a render, for UI that wants a stage label alongside the fraction.
+    enum RenderStage: Sendable {
+        /// Sampling the clip for the background plate (before any output frame exists).
+        case analyzing
+        /// Writing output frames.
+        case rendering
+    }
+
+    /// Fraction of the progress range reserved for the analyzing pre-pass.
+    private static let analyzingShare = 0.1
+
     func render(
         sourceURL: URL,
         settings: RenderSettings,
         output: Output = .trail,
         watermark: Bool = false,
         maxOutputDimension: CGFloat = .greatestFiniteMagnitude,
-        progress: (@Sendable (Double) -> Void)? = nil
+        progress: (@Sendable (Double) -> Void)? = nil,
+        stage: (@Sendable (RenderStage) -> Void)? = nil
     ) async throws -> URL {
         let reader = try await VideoFrameReader(url: sourceURL)
         let info = reader.info
@@ -46,24 +58,40 @@ struct TrailRenderEngine {
         let context = SharedRender.ciContext
         let workingColorSpace = context.workingColorSpace ?? CGColorSpaceCreateDeviceRGB()
         let flattener = PixelBufferFlattener(size: fullSize, colorSpace: workingColorSpace)
+        // Independent pool for the ±K look-ahead ring buffer: each decoded frame is rendered into its
+        // own GPU buffer so it survives across loop iterations (the reader vends recycled sample
+        // buffers) without contending with the accumulator's flatten pool.
+        let frameFlattener = PixelBufferFlattener(size: fullSize, colorSpace: workingColorSpace)
         let maskBuilder = MotionMaskBuilder()
         let compositor = TrailCompositor()
         let watermarkImage: CIImage? = watermark ? WatermarkRenderer().makeWatermark(outputSize: outputSize) : nil
         let colorizer = settings.colorStyle == .ageGradient ? TrailColorizer() : nil
         let keepMask = IgnoreMaskBuilder.keepMask(regions: settings.ignoreRegions, size: fullSize)
 
-        // Static background reference = temporal median across the clip (spec §11.2).
-        let staticBackground = try await BackgroundEstimator().estimate(url: sourceURL, cropRect: fullRect)
-        let slowUpdate = settings.backgroundMode == .slowUpdate
+        // Static background = temporal median across the clip (spec §11.2). It is **not** the detection
+        // reference any more (detection is temporal); it is the clean display **plate** the trails
+        // composite over, and the seed for the accumulator. Its sampling is surfaced as the
+        // "analyzing" slice of the progress range so the bar moves from the very start.
+        stage?(.analyzing)
+        let staticBackground = try await BackgroundEstimator().estimate(url: sourceURL, cropRect: fullRect) { fraction in
+            progress?(fraction * Self.analyzingShare)
+        }
+        stage?(.rendering)
         let decay = settings.ageDecay
-        var dynamicBackground = staticBackground
+        // Display backdrop: trails composite over the frozen plate, or over the live current frame.
+        let liveBackdrop = settings.backgroundMode == .live
+
+        // Detection horizon K (frames): each frame is differenced against the frames ±K away. Slow
+        // drift (clouds, swaying foliage) is unchanged over ±K and cancels; fast subjects survive.
+        let horizon = settings.motionHorizonFrames(fps: Double(info.nominalFrameRate))
+        let darkLumaCutoff = 0.06
 
         let registrar = settings.stabilizationEnabled ? FrameRegistrar(reference: staticBackground) : nil
 
         // Trail frequency → how many evenly-spaced snapshots leave a *persistent* silhouette in
         // the trail. The live subject is still drawn on top of every frame, so motion stays smooth
         // regardless of frequency; only the permanence of the trail changes.
-        let snapshotCount = settings.snapshotCount(forFrameCount: info.estimatedFrameCount)
+        let snapshotCount = settings.snapshotCount(durationSeconds: info.duration.seconds)
 
         let total = max(1, info.estimatedFrameCount)
         var written = 0
@@ -74,63 +102,130 @@ struct TrailRenderEngine {
 
         // Seed the output with the clean background as frame 0.
         if output == .trail {
-            let seed = prepareExport(staticBackground, cropRect: cropRect, scale: exportScale,
-                                     outputRect: outputRect, watermark: watermarkImage)
-            try await writer.append(seed, context: context)
+            let seedBuffer = try autoreleasepool {
+                try writer.makeFrameBuffer(
+                    prepareExport(staticBackground, cropRect: cropRect, scale: exportScale,
+                                  outputRect: outputRect, watermark: watermarkImage),
+                    context: context)
+            }
+            await writer.append(seedBuffer)
         }
 
+        // Delay-line over the decoded stream so each processed "centre" frame has its ±K neighbours
+        // available. At most 2K+1 flattened frames are resident at once (bounded regardless of clip
+        // length, so the long-clip memory invariant holds). Each frame stores whether it's bright, so
+        // a dark fade neighbour can be skipped rather than flooding the temporal difference.
+        struct WindowFrame { let image: CIImage; let bright: Bool }
+        var window: [WindowFrame] = []
+        var firstIndex = 0          // global index of window[0]
+        var nextToProcess = 0       // global index of the next centre to emit
+
+        // Build the output buffer for centre frame `centre` (nil = skip a leading dark fade-in). The
+        // heavy Core Image work runs in an autoreleasepool so transient Metal textures/IOSurfaces are
+        // reclaimed every frame; the encode-side `append` is awaited *outside* the pool by `emit`.
+        func renderCentre(_ centre: Int) throws -> CVPixelBuffer? {
+            try autoreleasepool {
+                let rec = window[centre - firstIndex]
+                if !sawBright {
+                    if !rec.bright { return nil }   // skip leading black fade-in
+                    sawBright = true
+                }
+                defer { processedIndex += 1 }
+                // ~`snapshotCount` evenly-spaced frames leave a permanent mark.
+                let isSnapshot = processedIndex == 0 ||
+                    Int(Double(processedIndex) * Double(snapshotCount) / Double(total)) >
+                    Int(Double(processedIndex - 1) * Double(snapshotCount) / Double(total))
+
+                // ±K neighbours; a dark fade neighbour is treated as missing so the temporal diff
+                // isn't flooded across a fade boundary (the symmetric min then uses the clean side).
+                func neighbour(_ gi: Int) -> CIImage? {
+                    guard gi >= firstIndex, gi - firstIndex < window.count else { return nil }
+                    let n = window[gi - firstIndex]
+                    return n.bright ? n.image : nil
+                }
+                let current = rec.image   // already oriented, registered and flattened at decode time
+                let rawMask = maskBuilder.makeMask(current: current,
+                                                   earlier: neighbour(centre - horizon),
+                                                   later: neighbour(centre + horizon),
+                                                   settings: settings)
+                var coverage = alphaToGray(rawMask, rect: fullRect)
+                if let keepMask { coverage = multiply(coverage, keepMask, rect: fullRect) }
+                let mask = maskToAlpha(coverage)
+
+                let exportFrame: CIImage
+                switch output {
+                case .trail:
+                    // Fade the persistent trail every frame for smooth decay.
+                    if decay < 1 { ageMap = flattener.flatten(scaleGray(ageMap, decay), rect: fullRect, context: context) }
+
+                    // Display = persistent trail + the current (live) subject on top → smooth motion.
+                    let displayAccumulator = compositor.compose(current: current, over: accumulator, mask: mask, mode: settings.trailMode)
+                    let displayAgeMap = maximum(coverage, ageMap, rect: fullRect)
+                    let trailColor = colorizer?.colorize(displayAgeMap) ?? displayAccumulator
+                    // Trails over the frozen plate (`.frozen`) or the live moving scene (`.live`).
+                    let backdrop = liveBackdrop ? current : staticBackground
+                    var displayed = blendWithMask(foreground: trailColor, background: backdrop,
+                                                  maskAlpha: maskToAlpha(displayAgeMap), rect: fullRect)
+                    // Ignore regions play the live video, not the frozen plate: show the current frame
+                    // where keep = 0 (inside a region) and the trail composite where keep = 1 (outside).
+                    if let keepMask {
+                        displayed = blendWithMask(foreground: displayed, background: current,
+                                                  maskAlpha: maskToAlpha(keepMask), rect: fullRect)
+                    }
+                    exportFrame = prepareExport(displayed, cropRect: cropRect, scale: exportScale,
+                                                outputRect: outputRect, watermark: watermarkImage)
+
+                    // Persist the silhouette only at snapshot frames.
+                    if isSnapshot {
+                        accumulator = flattener.flatten(displayAccumulator, rect: fullRect, context: context)
+                        ageMap = flattener.flatten(displayAgeMap, rect: fullRect, context: context)
+                    }
+                case .mask:
+                    exportFrame = prepareExport(mask.cropped(to: fullRect), cropRect: cropRect,
+                                                scale: exportScale, outputRect: outputRect, watermark: nil)
+                }
+
+                return try writer.makeFrameBuffer(exportFrame, context: context)
+            }
+        }
+
+        // Emit one centre frame, then drop window frames no later centre will need.
+        func emit(_ centre: Int) async throws {
+            if let frameBuffer = try renderCentre(centre) {
+                await writer.append(frameBuffer)
+                written += 1
+                progress?(Self.analyzingShare + (1 - Self.analyzingShare) * min(1, Double(written) / Double(total)))
+            }
+            nextToProcess += 1
+            let keepFrom = max(0, nextToProcess - horizon)
+            if keepFrom > firstIndex {
+                window.removeFirst(keepFrom - firstIndex)
+                firstIndex = keepFrom
+            }
+        }
+
+        var readIndex = 0
         while let raw = try reader.nextFrame() {
             try Task.checkCancellation()
-            let frame = raw.cropped(to: fullRect)
-
-            if !sawBright {
-                if BackgroundEstimator.meanLuma(frame, rect: fullRect, context: context) < 0.06 { continue }
-                sawBright = true
+            let oriented = raw.cropped(to: fullRect)
+            // Decode-time work (brightness probe + optional stabilization + flatten into the ring
+            // buffer's own GPU buffer) inside a pool so its temporaries don't accumulate.
+            var bright = false
+            let frame = autoreleasepool { () -> CIImage in
+                bright = BackgroundEstimator.meanLuma(oriented, rect: fullRect, context: context) >= darkLumaCutoff
+                let aligned = (registrar?.align(oriented) ?? oriented).cropped(to: fullRect)
+                return frameFlattener.flatten(aligned, rect: fullRect, context: context)
             }
-            defer { processedIndex += 1 }
-            // ~`snapshotCount` evenly-spaced frames leave a permanent mark.
-            let isSnapshot = processedIndex == 0 ||
-                Int(Double(processedIndex) * Double(snapshotCount) / Double(total)) >
-                Int(Double(processedIndex - 1) * Double(snapshotCount) / Double(total))
-
-            let aligned = (registrar?.align(frame) ?? frame).cropped(to: fullRect)
-            let backgroundForMask = slowUpdate ? dynamicBackground : staticBackground
-            let rawMask = maskBuilder.makeMask(current: aligned, background: backgroundForMask, settings: settings)
-            var coverage = alphaToGray(rawMask, rect: fullRect)
-            if let keepMask { coverage = multiply(coverage, keepMask, rect: fullRect) }
-            let mask = maskToAlpha(coverage)
-
-            switch output {
-            case .trail:
-                // Fade the persistent trail every frame for smooth decay.
-                if decay < 1 { ageMap = flattener.flatten(scaleGray(ageMap, decay), rect: fullRect, context: context) }
-
-                // Display = persistent trail + the current (live) subject on top → smooth motion.
-                let displayAccumulator = compositor.compose(current: aligned, over: accumulator, mask: mask, mode: settings.trailMode)
-                let displayAgeMap = maximum(coverage, ageMap, rect: fullRect)
-                let trailColor = colorizer?.colorize(displayAgeMap) ?? displayAccumulator
-                let displayed = blendWithMask(foreground: trailColor, background: staticBackground,
-                                              maskAlpha: maskToAlpha(displayAgeMap), rect: fullRect)
-                let exportFrame = prepareExport(displayed, cropRect: cropRect, scale: exportScale,
-                                                outputRect: outputRect, watermark: watermarkImage)
-                try await writer.append(exportFrame, context: context)
-
-                // Persist the silhouette only at snapshot frames.
-                if isSnapshot {
-                    accumulator = flattener.flatten(displayAccumulator, rect: fullRect, context: context)
-                    ageMap = flattener.flatten(displayAgeMap, rect: fullRect, context: context)
-                    if slowUpdate {
-                        dynamicBackground = updateBackground(dynamicBackground, with: aligned, mask: mask, rect: fullRect, flattener: flattener, context: context)
-                    }
-                }
-            case .mask:
-                let exportFrame = prepareExport(mask.cropped(to: fullRect), cropRect: cropRect,
-                                                scale: exportScale, outputRect: outputRect, watermark: nil)
-                try await writer.append(exportFrame, context: context)
+            window.append(WindowFrame(image: frame, bright: bright))
+            readIndex += 1
+            // Process every centre that now has a full +K look-ahead.
+            while nextToProcess <= readIndex - 1 - horizon {
+                try await emit(nextToProcess)
             }
-
-            written += 1
-            progress?(min(1, Double(written) / Double(total)))
+        }
+        // Flush the tail: remaining centres use whatever look-ahead is left (`later` → nil at the end).
+        while nextToProcess < readIndex {
+            try await emit(nextToProcess)
         }
 
         await writer.finish()
@@ -216,20 +311,5 @@ struct TrailRenderEngine {
         f.backgroundImage = background
         f.maskImage = maskAlpha
         return (f.outputImage ?? background).cropped(to: rect)
-    }
-
-    private func updateBackground(_ background: CIImage, with current: CIImage, mask: CIImage,
-                                  rect: CGRect, flattener: PixelBufferFlattener, context: CIContext) -> CIImage {
-        let mixed = setAlpha(current, 0.05).composited(over: background)
-        let updated = blendWithMask(foreground: background, background: mixed, maskAlpha: mask, rect: rect)
-        return flattener.flatten(updated, rect: rect, context: context)
-    }
-
-    private func setAlpha(_ image: CIImage, _ alpha: CGFloat) -> CIImage {
-        let m = CIFilter.colorMatrix()
-        m.inputImage = image
-        m.aVector = CIVector(x: 0, y: 0, z: 0, w: 0)
-        m.biasVector = CIVector(x: 0, y: 0, z: 0, w: alpha)
-        return m.outputImage ?? image
     }
 }

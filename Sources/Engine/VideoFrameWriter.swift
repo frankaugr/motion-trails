@@ -13,12 +13,10 @@ final class VideoFrameWriter {
     private let adaptor: AVAssetWriterInputPixelBufferAdaptor
     private let frameDuration: CMTime
     private let renderSize: CGSize
-    private let videoBufferTransform: CGAffineTransform
     private var frameIndex: Int64 = 0
 
     init(outputURL: URL, size: CGSize, frameRate: Int) throws {
         renderSize = size
-        videoBufferTransform = CGAffineTransform(a: 1, b: 0, c: 0, d: -1, tx: 0, ty: size.height)
         if FileManager.default.fileExists(atPath: outputURL.path) {
             try? FileManager.default.removeItem(at: outputURL)
         }
@@ -62,14 +60,19 @@ final class VideoFrameWriter {
         writer.startSession(atSourceTime: .zero)
     }
 
-    /// Renders a `CIImage` into a pooled buffer and appends it as the next output frame.
+    /// Renders a `CIImage` into a pooled pixel buffer (the allocation-heavy Core Image / Metal
+    /// half of writing a frame) and returns it, ready to be appended.
     ///
-    /// The encoded buffer is vertically flipped because Core Image's working coordinate space
-    /// has y=0 at the bottom, while video playback treats the first encoded row as the top.
-    /// The returned image maps that buffer back into the engine's normal coordinate space so
-    /// it can be reused as the next accumulator without growing the compositing graph.
-    @discardableResult
-    func append(_ image: CIImage, context: CIContext) async throws -> CIImage {
+    /// This is deliberately split from `append`: the engine calls it inside a per-frame
+    /// `autoreleasepool` so the transient Metal textures / IOSurfaces this render spawns are
+    /// reclaimed every frame instead of piling up across a long clip, while the async `append`
+    /// stays outside the pool (you can't suspend across an `autoreleasepool` body).
+    ///
+    /// The render is a straight orientation passthrough: `CIContext.render(_:to:)` preserves the
+    /// image's visual orientation into the buffer, and `VideoFrameReader` has already normalized
+    /// every frame upright via `preferredTransform`. (There is deliberately **no** vertical flip
+    /// here — an earlier one inverted every export; see the coordinate note in CLAUDE.md.)
+    func makeFrameBuffer(_ image: CIImage, context: CIContext) throws -> CVPixelBuffer {
         guard let pool = adaptor.pixelBufferPool else { throw VideoIOError.cannotStartWriting }
 
         var pixelBuffer: CVPixelBuffer?
@@ -77,21 +80,18 @@ final class VideoFrameWriter {
         guard let buffer = pixelBuffer else { throw VideoIOError.cannotStartWriting }
 
         let renderRect = CGRect(origin: .zero, size: renderSize)
-        let imageForEncoding = image.transformed(by: videoBufferTransform)
-        context.render(
-            imageForEncoding,
-            to: buffer,
-            bounds: renderRect,
-            colorSpace: CGColorSpace(name: CGColorSpace.sRGB)
-        )
+        context.render(image, to: buffer, bounds: renderRect,
+                       colorSpace: CGColorSpace(name: CGColorSpace.sRGB))
+        return buffer
+    }
 
+    /// Appends a buffer produced by `makeFrameBuffer` at the next fixed-rate presentation time,
+    /// waiting for the encoder to drain if it has fallen behind.
+    func append(_ buffer: CVPixelBuffer) async {
         await waitUntilReady()
         let pts = CMTimeMultiply(frameDuration, multiplier: Int32(truncatingIfNeeded: frameIndex))
         adaptor.append(buffer, withPresentationTime: pts)
         frameIndex += 1
-        return CIImage(cvPixelBuffer: buffer)
-            .transformed(by: videoBufferTransform)
-            .cropped(to: renderRect)
     }
 
     func finish() async {

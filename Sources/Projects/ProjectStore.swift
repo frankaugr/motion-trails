@@ -120,6 +120,14 @@ final class ProjectStore {
         replace(project)
     }
 
+    /// Renames a project (empty names clear back to the date-based default).
+    func rename(_ project: Project, to name: String) {
+        var updated = project
+        let trimmed = name.trimmingCharacters(in: .whitespacesAndNewlines)
+        updated.name = trimmed.isEmpty ? nil : trimmed
+        try? update(updated)
+    }
+
     /// Copies a freshly rendered export into the project's `exports/` directory and records it.
     @discardableResult
     func addExport(_ outputURL: URL, to project: Project) throws -> Project {
@@ -140,9 +148,31 @@ final class ProjectStore {
         projects.removeAll { $0.id == project.id }
     }
 
-    /// Total bytes used by all stored projects (spec §14 storage indicator).
-    var totalStorageBytes: Int64 {
-        directorySize(rootDirectory)
+    /// Removes a single export file and its manifest entry.
+    @discardableResult
+    func deleteExport(_ filename: String, from project: Project) -> Project {
+        try? FileManager.default.removeItem(at: exportsDirectory(for: project).appendingPathComponent(filename))
+        var updated = project
+        updated.exportFilenames.removeAll { $0 == filename }
+        try? update(updated)
+        return updated
+    }
+
+    /// When an export was rendered, recovered from its `export-<epoch>.mp4` filename.
+    static func exportDate(filename: String) -> Date? {
+        guard let stem = filename.split(separator: ".").first,
+              let epochText = stem.split(separator: "-").last,
+              let epoch = TimeInterval(epochText) else { return nil }
+        return Date(timeIntervalSince1970: epoch)
+    }
+
+    /// Total bytes used by all stored projects (spec §14 storage indicator). Walks the whole
+    /// store, so call it from a background task — not per body evaluation on the main thread.
+    func computeTotalStorageBytes() async -> Int64 {
+        let root = rootDirectory
+        return await Task.detached(priority: .utility) {
+            Self.directorySize(root)
+        }.value
     }
 
     // MARK: - Private
@@ -168,7 +198,7 @@ final class ProjectStore {
         }
     }
 
-    private func directorySize(_ url: URL) -> Int64 {
+    private static func directorySize(_ url: URL) -> Int64 {
         let fm = FileManager.default
         guard let enumerator = fm.enumerator(at: url, includingPropertiesForKeys: [.fileSizeKey]) else { return 0 }
         var total: Int64 = 0

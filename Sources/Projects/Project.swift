@@ -6,6 +6,9 @@ import Foundation
 struct Project: Codable, Identifiable, Equatable, Hashable {
     let id: UUID
     var createdAt: Date
+    /// Optional user-given name (library rename). `nil` falls back to the capture date.
+    /// Optional so manifests written before the field existed keep decoding.
+    var name: String?
     /// Source clip filename within the project directory (e.g. "source.mov").
     var sourceFilename: String
     /// Poster thumbnail filename, if one was generated.
@@ -19,6 +22,7 @@ struct Project: Codable, Identifiable, Equatable, Hashable {
 
     init(id: UUID = UUID(),
          createdAt: Date = Date(),
+         name: String? = nil,
          sourceFilename: String = "source.mov",
          thumbnailFilename: String? = nil,
          settings: RenderSettings = RenderSettings(),
@@ -26,6 +30,7 @@ struct Project: Codable, Identifiable, Equatable, Hashable {
          sourceDuration: Double = 0) {
         self.id = id
         self.createdAt = createdAt
+        self.name = name
         self.sourceFilename = sourceFilename
         self.thumbnailFilename = thumbnailFilename
         self.settings = settings
@@ -34,4 +39,10 @@ struct Project: Codable, Identifiable, Equatable, Hashable {
     }
 
     var hasExport: Bool { !exportFilenames.isEmpty }
+
+    /// Library/editor title: the user's name for the project, falling back to the capture date.
+    var displayName: String {
+        if let name, !name.isEmpty { return name }
+        return createdAt.formatted(.dateTime.month().day().hour().minute())
+    }
 }

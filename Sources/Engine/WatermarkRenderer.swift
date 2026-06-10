@@ -42,18 +42,14 @@ struct WatermarkRenderer {
 
     /// Composites a prepared watermark into the bottom-right of the *displayed* video.
     ///
-    /// The engine's CI space is vertically mirrored vs. the encoded frame (the writer flips rows
-    /// on encode, which leaves the pre-flipped source content upright). A freshly generated overlay
-    /// is upright in CI, so we **pre-flip it vertically** here — the writer's flip then lands the
-    /// text upright — and place it at CI-top so it ends up at the visual bottom.
+    /// The encode is a straight orientation passthrough (the writer no longer flips rows), so the
+    /// engine's y-up CI space matches the final video: visual bottom is low `y`. The generated
+    /// overlay is already upright, so we just place it near `y = 0` at the right edge — no flip.
     func apply(_ watermark: CIImage, to image: CIImage, outputRect: CGRect) -> CIImage {
         let pad = outputRect.height * 0.02
         let x = outputRect.maxX - watermark.extent.width - pad
-        let y = outputRect.maxY - watermark.extent.height - pad
-        let flip = CGAffineTransform(a: 1, b: 0, c: 0, d: -1, tx: 0, ty: watermark.extent.height)
-        let placed = watermark
-            .transformed(by: flip)
-            .transformed(by: CGAffineTransform(translationX: x, y: y))
+        let y = outputRect.minY + pad
+        let placed = watermark.transformed(by: CGAffineTransform(translationX: x, y: y))
         return placed.composited(over: image).cropped(to: outputRect)
     }
 }

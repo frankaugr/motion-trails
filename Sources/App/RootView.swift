@@ -18,6 +18,9 @@ struct RootView: View {
         }
         .environment(store)
         .environment(monetization)
+        // Dark-first identity: the whole app lives on the dark canvas (creative tools read as
+        // tools, not as Settings), with the trail-teal accent from the asset catalog.
+        .preferredColorScheme(.dark)
     }
 }
 

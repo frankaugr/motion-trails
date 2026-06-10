@@ -28,6 +28,9 @@ final class StabilityMonitor {
     }
 
     private(set) var stability: Stability = .unknown
+    /// Device tilt from portrait-upright, in degrees (gravity-derived). Drives the capture
+    /// screen's level indicator: 0° = a level framing.
+    private(set) var tiltDegrees: Double = 0
 
     private let motion = CMMotionManager()
     private var samples: [Double] = []
@@ -42,6 +45,10 @@ final class StabilityMonitor {
             self.samples.append(magnitude)
             if self.samples.count > 30 { self.samples.removeFirst() }
             self.classify()
+
+            // Portrait-upright gravity is (0, -1, 0); the x component reads sideways lean.
+            let g = motion.gravity
+            self.tiltDegrees = atan2(g.x, -g.y) * 180 / .pi
         }
     }
 
@@ -49,6 +56,7 @@ final class StabilityMonitor {
         motion.stopDeviceMotionUpdates()
         samples.removeAll()
         stability = .unknown
+        tiltDegrees = 0
     }
 
     private func classify() {

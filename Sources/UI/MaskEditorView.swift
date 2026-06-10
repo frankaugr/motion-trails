@@ -37,8 +37,8 @@ struct MaskEditorView: View {
                     // Draft region being drawn.
                     if let draft {
                         Rectangle()
-                            .fill(.yellow.opacity(0.25))
-                            .overlay(Rectangle().stroke(.yellow, lineWidth: 2))
+                            .fill(Color.accentColor.opacity(0.25))
+                            .overlay(Rectangle().stroke(Color.accentColor, lineWidth: 2))
                             .frame(width: draft.width, height: draft.height)
                             .position(x: draft.midX, y: draft.midY)
                     }
