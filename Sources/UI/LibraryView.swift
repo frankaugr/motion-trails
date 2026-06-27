@@ -245,8 +245,24 @@ struct LibraryView: View {
         errorMessage = nil
         defer { isImporting = false }
         do {
-            let clipURL = try await SampleClipFactory().makeClip()
-            var project = try await store.createProject(fromSourceURL: clipURL)
+            // Prefer the bundled real-footage demo clip (Resources/DemoClip.mp4) — copied to a temp
+            // file so the cleanup below never touches the read-only app bundle. Fall back to the
+            // synthesized clip if it's somehow absent from the bundle.
+            let clipURL: URL
+            if let bundled = Bundle.main.url(forResource: "DemoClip", withExtension: "mp4") {
+                let tmp = FileManager.default.temporaryDirectory
+                    .appendingPathComponent("demo-\(UUID().uuidString).mp4")
+                try FileManager.default.copyItem(at: bundled, to: tmp)
+                clipURL = tmp
+            } else {
+                clipURL = try await SampleClipFactory().makeClip()
+            }
+            // Seed the demo with settings tuned for the footage (dark birds on a bright sky), so the
+            // first render already looks like the showcase rather than the neutral default.
+            var demoSettings = RenderSettings()
+            demoSettings.contrastMode = .silhouette
+            demoSettings.trailFrequency = 0.8
+            var project = try await store.createProject(fromSourceURL: clipURL, settings: demoSettings)
             try? FileManager.default.removeItem(at: clipURL)
             project.name = "Demo · flying birds"
             try? store.update(project)

@@ -1,0 +1,17 @@
+<!doctype html><html><head><meta charset="utf-8"><style>
+  :root{ --accent:#5cccaa; }
+  *{ margin:0; padding:0; box-sizing:border-box; }
+  html,body{ width:1080px; height:1920px; overflow:hidden; background:transparent;
+    font-family:-apple-system,"SF Pro Display","Helvetica Neue",Helvetica,Arial,sans-serif;
+    -webkit-font-smoothing:antialiased; }
+  /* Scrim that fades to fully transparent upward, keeping the caption legible over sky. */
+  .scrim{ position:absolute; left:0; right:0; bottom:0; height:560px;
+    background:linear-gradient(to top, rgba(8,9,11,.78) 0%, rgba(8,9,11,.5) 40%, rgba(8,9,11,0) 100%); }
+  .cap{ position:absolute; left:0; right:0; bottom:250px; text-align:center; color:#fff;
+    font-size:52px; font-weight:600; letter-spacing:-.3px; padding:0 90px; line-height:1.18; }
+  .cap .dot{ display:inline-block; width:16px; height:16px; border-radius:50%;
+    background:var(--accent); margin-right:22px; vertical-align:middle; transform:translateY(-6px); }
+</style></head><body>
+  <div class="scrim"></div>
+  <div class="cap"><span class="dot"></span>REPLACE_TEXT</div>
+</body></html>
