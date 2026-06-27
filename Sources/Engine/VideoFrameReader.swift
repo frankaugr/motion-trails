@@ -7,6 +7,7 @@ enum VideoIOError: Error, LocalizedError {
     case cannotStartReading
     case cannotStartWriting
     case readerFailed(Error?)
+    case writerFailed(Error?)
 
     var errorDescription: String? {
         switch self {
@@ -14,6 +15,7 @@ enum VideoIOError: Error, LocalizedError {
         case .cannotStartReading: return "Could not start reading the source video."
         case .cannotStartWriting: return "Could not start writing the output video."
         case .readerFailed(let e): return "Reading the source video failed: \(e?.localizedDescription ?? "unknown error")."
+        case .writerFailed(let e): return "Writing the output video failed: \(e?.localizedDescription ?? "unknown error")."
         }
     }
 }

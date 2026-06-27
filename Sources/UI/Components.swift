@@ -1,25 +1,7 @@
 import SwiftUI
 import AVKit
 
-/// Small shared UI pieces used across screens, so upsells, playback and branding stay consistent.
-
-/// The one watermark/premium upsell chip — replaces the ad-hoc crown labels that were duplicated
-/// across the editor and result screens.
-struct UpsellChip: View {
-    let text: String
-    let action: () -> Void
-
-    var body: some View {
-        Button(action: action) {
-            Label(text, systemImage: "crown.fill")
-                .font(.caption.weight(.medium))
-                .foregroundStyle(Color.accentColor)
-                .padding(.horizontal, 12).padding(.vertical, 6)
-                .background(Theme.surfaceBright, in: Capsule())
-        }
-        .buttonStyle(.plain)
-    }
-}
+/// Small shared UI pieces used across screens, so playback and branding stay consistent.
 
 /// Seamlessly looping video playback — trail clips are short and read best on a loop.
 /// (`AVPlayer` alone freezes on the last frame; `AVPlayerLooper` needs a queue player.)
@@ -48,7 +30,7 @@ struct LoopingPlayerView: View {
 }
 
 /// Animated brand motif: a dot sweeping a sine path, leaving fading copies — the app's effect,
-/// abstracted. Used by the paywall hero and onboarding.
+/// abstracted. Used by onboarding and the library's empty state.
 struct TrailMotif: View {
     var dotColor: Color = .accentColor
 

@@ -24,15 +24,22 @@ enum ProjectStoreError: Error, LocalizedError {
 final class ProjectStore {
     private(set) var projects: [Project] = []
     let rootDirectory: URL
+    /// Where regenerable per-project preview caches live — Caches, so they are purgeable under
+    /// storage pressure and excluded from iCloud backup, unlike the backed-up project directory.
+    let cacheRootDirectory: URL
 
     init(rootDirectory: URL? = nil) {
         if let rootDirectory {
             self.rootDirectory = rootDirectory
+            self.cacheRootDirectory = rootDirectory.appendingPathComponent("Caches", isDirectory: true)
         } else {
             let appSupport = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
             self.rootDirectory = appSupport.appendingPathComponent("Projects", isDirectory: true)
+            let caches = FileManager.default.urls(for: .cachesDirectory, in: .userDomainMask)[0]
+            self.cacheRootDirectory = caches.appendingPathComponent("Projects", isDirectory: true)
         }
         try? FileManager.default.createDirectory(at: self.rootDirectory, withIntermediateDirectories: true)
+        try? FileManager.default.createDirectory(at: self.cacheRootDirectory, withIntermediateDirectories: true)
         load()
     }
 
@@ -49,6 +56,10 @@ final class ProjectStore {
     }
     func exportsDirectory(for project: Project) -> URL {
         directory(for: project).appendingPathComponent("exports", isDirectory: true)
+    }
+    /// Per-project preview-cache directory under Caches (passed to `TrailPreviewRenderer.prepare`).
+    func previewCacheDirectory(for project: Project) -> URL {
+        cacheRootDirectory.appendingPathComponent(project.id.uuidString, isDirectory: true)
     }
     func exportURLs(for project: Project) -> [URL] {
         let dir = exportsDirectory(for: project)
@@ -133,7 +144,9 @@ final class ProjectStore {
     func addExport(_ outputURL: URL, to project: Project) throws -> Project {
         let exportsDir = exportsDirectory(for: project)
         try FileManager.default.createDirectory(at: exportsDir, withIntermediateDirectories: true)
-        let filename = "export-\(Int(Date().timeIntervalSince1970)).mp4"
+        // Epoch keeps the filename sortable/date-parseable; the short UUID suffix prevents two
+        // renders in the same second from colliding (which used to throw and lose the export).
+        let filename = "export-\(Int(Date().timeIntervalSince1970))-\(UUID().uuidString.prefix(6)).mp4"
         try FileManager.default.copyItem(at: outputURL, to: exportsDir.appendingPathComponent(filename))
 
         var updated = project
@@ -145,6 +158,7 @@ final class ProjectStore {
 
     func delete(_ project: Project) {
         try? FileManager.default.removeItem(at: directory(for: project))
+        try? FileManager.default.removeItem(at: previewCacheDirectory(for: project))
         projects.removeAll { $0.id == project.id }
     }
 
@@ -158,11 +172,12 @@ final class ProjectStore {
         return updated
     }
 
-    /// When an export was rendered, recovered from its `export-<epoch>.mp4` filename.
+    /// When an export was rendered, recovered from its `export-<epoch>[-<suffix>].mp4` filename.
+    /// The epoch is always the second hyphen-component (older names had no suffix).
     static func exportDate(filename: String) -> Date? {
-        guard let stem = filename.split(separator: ".").first,
-              let epochText = stem.split(separator: "-").last,
-              let epoch = TimeInterval(epochText) else { return nil }
+        let stem = filename.split(separator: ".").first ?? Substring(filename)
+        let parts = stem.split(separator: "-")
+        guard parts.count >= 2, let epoch = TimeInterval(parts[1]) else { return nil }
         return Date(timeIntervalSince1970: epoch)
     }
 
@@ -181,7 +196,8 @@ final class ProjectStore {
         let encoder = JSONEncoder()
         encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
         let data = try encoder.encode(project)
-        try data.write(to: directory(for: project).appendingPathComponent("manifest.json"))
+        // Atomic so a crash mid-write can't leave a truncated manifest that loses the project.
+        try data.write(to: directory(for: project).appendingPathComponent("manifest.json"), options: .atomic)
     }
 
     @MainActor

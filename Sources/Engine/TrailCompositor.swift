@@ -9,7 +9,7 @@ import CoreImage.CIFilterBuiltins
 ///
 /// - `.replacement` (default): the current pixel overwrites the accumulator, so a later subject
 ///   cleanly replaces an earlier one at the same pixel.
-/// - `.overlay` (premium): the current pixel is half-blended with the accumulator, so overlapping
+/// - `.overlay`: the current pixel is half-blended with the accumulator, so overlapping
 ///   passes layer into a softer, ghosted trail.
 struct TrailCompositor {
 

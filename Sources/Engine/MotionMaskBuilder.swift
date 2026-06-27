@@ -14,12 +14,17 @@ import CoreImage.CIFilterBuiltins
 struct MotionMaskBuilder {
 
     /// Temporal motion mask: subject = what differs from BOTH the `earlier` (t−K) and `later` (t+K)
-    /// frames. Pass `nil` for a neighbour that doesn't exist (clip ends, or a dark fade frame that
-    /// would otherwise flood the difference); detection then falls back to the single available side.
+    /// frames. Pass `nil` for a neighbour that doesn't exist; detection then falls back to the
+    /// single available side. **Production callers pass the pair both-or-nothing**: a one-sided
+    /// difference also lights up the subject's position in the *reference* frame (the trailing
+    /// "ghost" the symmetric min removes), which stamped false marks near clip ends — the engine
+    /// and preview shrink the horizon toward the centre instead and pass `nil` for both sides when
+    /// one can't be resolved.
     ///
     /// - Parameter radiusScale: multiplies the morphology radius so the mask can be built at a
-    ///   downscaled proxy resolution (the live preview) while keeping the same effective feature size
-    ///   as the full-resolution render. Leave at 1 for full-resolution masking.
+    ///   downscaled working resolution (the engine's mask working space and the live preview's
+    ///   proxy) while keeping the same effective feature size relative to the frame. Leave at 1
+    ///   when masking at full resolution.
     func makeMask(current: CIImage, earlier: CIImage?, later: CIImage?,
                   settings: RenderSettings, radiusScale: CGFloat = 1) -> CIImage {
         let mode = settings.contrastMode

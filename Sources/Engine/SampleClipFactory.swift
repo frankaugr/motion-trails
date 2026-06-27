@@ -57,9 +57,9 @@ struct SampleClipFactory {
                 }
                 return try writer.makeFrameBuffer(composite.cropped(to: rect), context: context)
             }
-            await writer.append(buffer)
+            try await writer.append(buffer)
         }
-        await writer.finish()
+        try await writer.finish()
         return url
     }
 

@@ -7,17 +7,15 @@ struct VideoRef: Identifiable, Hashable {
     var id: URL { url }
 }
 
-/// App root: owns the shared `ProjectStore` + `MonetizationStore` and hosts the project library.
+/// App root: owns the shared `ProjectStore` and hosts the project library.
 struct RootView: View {
     @State private var store = ProjectStore()
-    @State private var monetization = MonetizationStore()
 
     var body: some View {
         NavigationStack {
             LibraryView()
         }
         .environment(store)
-        .environment(monetization)
         // Dark-first identity: the whole app lives on the dark canvas (creative tools read as
         // tools, not as Settings), with the trail-teal accent from the asset catalog.
         .preferredColorScheme(.dark)

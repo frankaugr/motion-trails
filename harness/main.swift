@@ -196,7 +196,7 @@ func run() async throws {
 
     // ---- Test 3: render with fade on (exercises per-frame ageMap flatten path) ----
     print("\n[3] Render (fade enabled) — per-frame age-map flatten")
-    settings.fadeAmount = 0.5
+    settings.fadeSeconds = 2.0
     let t2 = Date()
     let fadeURL = try await TrailRenderEngine().render(sourceURL: srcURL, settings: settings)
     let fadeMs = Date().timeIntervalSince(t2) * 1000

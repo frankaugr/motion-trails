@@ -1,5 +1,10 @@
 # Motion Trails iOS App Specification
 
+> **Status note (stale on monetization):** the app now ships **free**. The freemium model this spec
+> describes — watermark, free-tier length limit, StoreKit gating, and premium-gated effects (§8, §19
+> and elsewhere) — was **removed**; all effects run for everyone and there is no paywall/watermark.
+> Where this spec and the code disagree on monetization, the code (and `CLAUDE.md`) are authoritative.
+
 ## 1. Product Summary
 
 Motion Trails is a consumer iOS and iPadOS app for creating short, social-ready videos where moving subjects leave realistic trails across a mostly static scene.

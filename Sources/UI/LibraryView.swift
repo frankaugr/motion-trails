@@ -7,7 +7,6 @@ import ImageIO
 /// management and delete. First launch shows onboarding and can seed a generated demo project.
 struct LibraryView: View {
     @Environment(ProjectStore.self) private var store
-    @Environment(MonetizationStore.self) private var monetization
 
     @AppStorage("com.frank.motiontrails.hasOnboarded") private var hasOnboarded = false
 
@@ -18,7 +17,6 @@ struct LibraryView: View {
     @State private var importStatus = "Importing…"
     @State private var errorMessage: String?
     @State private var showCapture = false
-    @State private var showPaywall = false
     @State private var renameTarget: Project?
     @State private var renameText = ""
     @State private var exportsTarget: Project?
@@ -45,7 +43,7 @@ struct LibraryView: View {
             }
             ToolbarItem(placement: .topBarTrailing) {
                 importControl {
-                    Image(systemName: monetization.videoImportUnlocked ? "photo.badge.plus" : "crown")
+                    Image(systemName: "photo.badge.plus")
                 }
                 .accessibilityLabel("Import a clip")
             }
@@ -86,7 +84,6 @@ struct LibraryView: View {
         .navigationDestination(item: $editProject) { project in
             RenderView(project: project, sourceURL: store.sourceURL(for: project))
         }
-        .sheet(isPresented: $showPaywall) { PaywallView() }
         .sheet(item: $exportsTarget) { project in
             ExportsSheet(project: project)
         }
@@ -192,8 +189,7 @@ struct LibraryView: View {
             }
             .buttonStyle(PrimaryButtonStyle())
             importControl {
-                Label("Import a clip",
-                      systemImage: monetization.videoImportUnlocked ? "photo.on.rectangle.angled" : "crown")
+                Label("Import a clip", systemImage: "photo.on.rectangle.angled")
                     .font(.subheadline.weight(.medium))
             }
             Button("Try a demo clip") {
@@ -207,20 +203,11 @@ struct LibraryView: View {
 
     // MARK: - Import / demo
 
-    /// Import is premium-gated: unlocked users get a real `PhotosPicker`; free users get a
-    /// button that opens the paywall instead (spec §8). `label` is shared so both states look
-    /// identical aside from the action.
-    @ViewBuilder
     private func importControl<Label: View>(@ViewBuilder label: () -> Label) -> some View {
-        if monetization.videoImportUnlocked {
-            PhotosPicker(selection: $selection, matching: .videos, photoLibrary: .shared()) {
-                label()
-            }
-            .disabled(isImporting)
-        } else {
-            Button { showPaywall = true } label: { label() }
-                .disabled(isImporting)
+        PhotosPicker(selection: $selection, matching: .videos, photoLibrary: .shared()) {
+            label()
         }
+        .disabled(isImporting)
     }
 
     private func importVideo(_ item: PhotosPickerItem) async {
@@ -233,9 +220,16 @@ struct LibraryView: View {
                 errorMessage = "Couldn't load that video. Try another clip."
                 return
             }
-            let project = try await store.createProject(fromSourceURL: picked.url)
+            importStatus = "Preparing clip…"
+            // Validate (reject no-video-track / over-length) and downscale 4K/HDR before render.
+            let source = try await ClipImporter.normalize(picked.url)
+            let project = try await store.createProject(fromSourceURL: source)
             try? FileManager.default.removeItem(at: picked.url)
+            if source != picked.url { try? FileManager.default.removeItem(at: source) }
             editProject = project
+        } catch let error as ImportError {
+            errorMessage = error.errorDescription
+            Theme.Haptics.failure()
         } catch {
             importLog.error("import failed: \(error.localizedDescription, privacy: .public)")
             errorMessage = error.localizedDescription

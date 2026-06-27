@@ -1,6 +1,7 @@
 import SwiftUI
 import AVKit
 import Photos
+import UIKit
 
 /// Canvas-first edit screen (spec §12.3, §6.2, §7.5, §7.6): the live preview stays pinned while
 /// one control group at a time is tuned beneath it, the primary action is always one tap away,
@@ -10,8 +11,10 @@ struct RenderView: View {
     let project: Project
     let sourceURL: URL
 
+    /// Export long-edge cap (spec §8, §16): up to 4K on supported devices.
+    private static let maxOutputDimension: CGFloat = 3840
+
     @Environment(ProjectStore.self) private var store
-    @Environment(MonetizationStore.self) private var monetization
 
     @State private var settings: RenderSettings
     @State private var phase: EditorPhase = .edit
@@ -19,15 +22,16 @@ struct RenderView: View {
     @State private var progress: Double = 0
     @State private var renderStage: TrailRenderEngine.RenderStage = .analyzing
     @State private var errorMessage: String?
-    @State private var comparing = false
     @State private var saveState: SaveState = .idle
+    /// The most recent export — kept when the user returns to editing, and seeded from the
+    /// project on open, so the last result stays viewable without re-rendering.
+    @State private var lastResultURL: URL?
 
     @State private var preview = TrailPreviewRenderer()
     @State private var renderTask: Task<Void, Never>?
     @State private var prepareTask: Task<Void, Never>?
     @State private var persistTask: Task<Void, Never>?
 
-    @State private var showPaywall = false
     @State private var showMaskEditor = false
 
     enum EditorPhase: Equatable {
@@ -63,19 +67,24 @@ struct RenderView: View {
     }
 
     var body: some View {
-        VStack(spacing: 0) {
-            canvas
-                .padding(.horizontal, 12)
-                .padding(.top, 6)
+        GeometryReader { geo in
+            VStack(spacing: 0) {
+                canvas
+                    .padding(.horizontal, 12)
+                    .padding(.top, 6)
 
-            if case .result = phase {
-                Spacer(minLength: 12)
-            } else {
-                chipRow
-                controlPanel
+                if case .result = phase {
+                    Spacer(minLength: 12)
+                } else {
+                    chipRow
+                    // Cap the panel at its design height but let it shrink on short/landscape
+                    // screens so the Generate bar can't be pushed off-screen.
+                    controlPanel(height: min(222, geo.size.height * 0.3))
+                }
+
+                bottomBar
             }
-
-            bottomBar
+            .frame(maxWidth: .infinity, maxHeight: .infinity)
         }
         .background(Theme.canvas.ignoresSafeArea())
         .navigationTitle(project.displayName)
@@ -83,8 +92,14 @@ struct RenderView: View {
         .toolbarBackground(Theme.canvas, for: .navigationBar)
         .toolbarBackground(.visible, for: .navigationBar)
         .task {
+            if lastResultURL == nil,
+               let current = store.projects.first(where: { $0.id == project.id }),
+               let latest = store.latestExportURL(for: current),
+               FileManager.default.fileExists(atPath: latest.path) {
+                lastResultURL = latest
+            }
             await preview.prepare(sourceURL: sourceURL, settings: settings,
-                                  cacheDirectory: store.directory(for: project))
+                                  cacheDirectory: store.previewCacheDirectory(for: project))
         }
         .onChange(of: settings) { old, new in
             schedulePersist()
@@ -100,9 +115,9 @@ struct RenderView: View {
             persistTask?.cancel()
             persistSettings()
         }
-        .sheet(isPresented: $showPaywall) { PaywallView() }
         .sheet(isPresented: $showMaskEditor) {
-            MaskEditorView(sourceURL: sourceURL, regions: $settings.ignoreRegions)
+            MaskEditorView(sourceURL: sourceURL, regions: $settings.ignoreRegions,
+                           strokes: $settings.ignoreStrokes)
         }
     }
 
@@ -120,28 +135,36 @@ struct RenderView: View {
                         .clipShape(RoundedRectangle(cornerRadius: Theme.panelRadius))
 
                 case .edit, .rendering:
-                    if let image = comparing ? preview.sourceImage : preview.previewImage {
+                    if let image = preview.previewImage {
                         Image(decorative: image, scale: 1, orientation: .up)
                             .resizable()
                             .scaledToFit()
+                            .modifier(HandheldPreviewShake(
+                                amount: phase == .edit ? settings.handheldAmount : 0))
                             .clipShape(RoundedRectangle(cornerRadius: 6))
                             .overlay { cropOverlay(in: geo.size, imageAspect: CGFloat(image.width) / CGFloat(image.height)) }
                             .padding(8)
-                            .onLongPressGesture(minimumDuration: .infinity) {
-                            } onPressingChanged: { pressing in
-                                guard phase == .edit, preview.sourceImage != nil else { return }
-                                comparing = pressing
-                            }
                     }
-                    if preview.isPreparing || (preview.previewImage == nil && !preview.isReady) {
+                    if preview.preparationFailed {
+                        VStack(spacing: 10) {
+                            Image(systemName: "exclamationmark.triangle")
+                                .font(.title2)
+                                .foregroundStyle(.secondary)
+                            Text("Couldn't build the preview.")
+                                .font(.subheadline)
+                                .foregroundStyle(.secondary)
+                            Button("Retry") { schedulePrepare() }
+                                .font(.subheadline.weight(.medium))
+                                .foregroundStyle(Color.accentColor)
+                        }
+                        .multilineTextAlignment(.center)
+                    } else if preview.isPreparing || (preview.previewImage == nil && !preview.isReady) {
                         ProgressView("Preparing preview…")
                             .tint(.white)
                             .foregroundStyle(.secondary)
                     }
-                    if comparing {
-                        canvasBadge("Source clip")
-                    } else if phase == .edit, preview.previewImage != nil {
-                        canvasBadge("Final frame · hold to compare")
+                    if phase == .edit, preview.previewImage != nil {
+                        canvasBadge("Preview")
                     }
                     if phase == .rendering {
                         renderingOverlay
@@ -172,7 +195,7 @@ struct RenderView: View {
     /// give immediate visual feedback.
     @ViewBuilder
     private func cropOverlay(in containerSize: CGSize, imageAspect: CGFloat) -> some View {
-        if let ratio = settings.cropAspect.ratio, phase == .edit, !comparing {
+        if let ratio = settings.cropAspect.ratio, phase == .edit {
             GeometryReader { imageGeo in
                 let size = imageGeo.size
                 let cropSize: CGSize = ratio > size.width / size.height
@@ -238,21 +261,16 @@ struct RenderView: View {
             Theme.Haptics.tap()
             withAnimation(.spring(duration: 0.3)) { activeGroup = group }
         } label: {
-            HStack(spacing: 5) {
-                if group == .effects && !monetization.premiumEffectsUnlocked {
-                    Image(systemName: "crown.fill").font(.caption2)
-                }
-                Text(group.label)
-            }
-            .font(.subheadline.weight(selected ? .semibold : .regular))
-            .foregroundStyle(selected ? Theme.onAccent : .secondary)
-            .padding(.horizontal, 14).padding(.vertical, 8)
-            .background(selected ? AnyShapeStyle(Color.accentColor) : AnyShapeStyle(Theme.surfaceBright), in: Capsule())
+            Text(group.label)
+                .font(.subheadline.weight(selected ? .semibold : .regular))
+                .foregroundStyle(selected ? Theme.onAccent : .secondary)
+                .padding(.horizontal, 14).padding(.vertical, 8)
+                .background(selected ? AnyShapeStyle(Color.accentColor) : AnyShapeStyle(Theme.surfaceBright), in: Capsule())
         }
         .buttonStyle(.plain)
     }
 
-    private var controlPanel: some View {
+    private func controlPanel(height: CGFloat) -> some View {
         ScrollView {
             VStack(alignment: .leading, spacing: 14) {
                 switch activeGroup {
@@ -265,7 +283,7 @@ struct RenderView: View {
             }
             .padding(16)
         }
-        .frame(height: 222)
+        .frame(height: height)
         .background(Theme.surface, in: RoundedRectangle(cornerRadius: Theme.panelRadius))
         .padding(.horizontal, 12)
         .disabled(phase == .rendering)
@@ -313,6 +331,22 @@ struct RenderView: View {
                 .tint(Color.accentColor)
                 caption("For handheld clips only — on tripod footage leave this off.")
             }
+            Button {
+                showMaskEditor = true
+            } label: {
+                HStack {
+                    Label("Ignore regions", systemImage: "rectangle.dashed")
+                        .font(.subheadline)
+                    Spacer()
+                    let ignoreCount = settings.ignoreRegions.count + settings.ignoreStrokes.count
+                    Text(ignoreCount == 0 ? "None" : "\(ignoreCount)")
+                        .font(.subheadline)
+                        .foregroundStyle(.secondary)
+                }
+                .padding(.vertical, 8).padding(.horizontal, 12)
+                .background(Theme.surfaceBright, in: RoundedRectangle(cornerRadius: 10))
+            }
+            .buttonStyle(.plain)
         }
     }
 
@@ -324,48 +358,51 @@ struct RenderView: View {
         }
     }
 
-    @ViewBuilder
     private var effectsPanel: some View {
-        if monetization.premiumEffectsUnlocked {
-            VStack(alignment: .leading, spacing: 12) {
-                VStack(alignment: .leading, spacing: 8) {
-                    panelRow("Blend", value: nil)
-                    optionChips(RenderSettings.TrailMode.allCases, selection: $settings.trailMode) { $0.label }
-                }
-                VStack(alignment: .leading, spacing: 8) {
-                    panelRow("Fade", value: nil)
-                    Slider(value: $settings.fadeAmount, in: 0...1)
-                        .accessibilityLabel("Trail fade")
-                    caption("Older trails fade toward the background.")
-                }
-                VStack(alignment: .leading, spacing: 8) {
-                    panelRow("Color", value: nil)
-                    optionChips(RenderSettings.ColorStyle.allCases, selection: $settings.colorStyle) { $0.label }
-                }
-                Button {
-                    showMaskEditor = true
-                } label: {
-                    HStack {
-                        Label("Ignore regions", systemImage: "rectangle.dashed")
-                            .font(.subheadline)
-                        Spacer()
-                        Text(settings.ignoreRegions.isEmpty ? "None" : "\(settings.ignoreRegions.count)")
-                            .font(.subheadline)
-                            .foregroundStyle(.secondary)
-                    }
-                    .padding(.vertical, 8).padding(.horizontal, 12)
-                    .background(Theme.surfaceBright, in: RoundedRectangle(cornerRadius: 10))
-                }
-                .buttonStyle(.plain)
+        VStack(alignment: .leading, spacing: 12) {
+            VStack(alignment: .leading, spacing: 8) {
+                panelRow("Blend", value: nil)
+                optionChips(RenderSettings.TrailMode.allCases, selection: $settings.trailMode) { $0.label }
             }
-        } else {
-            VStack(alignment: .leading, spacing: 10) {
-                Label("Premium effects", systemImage: "crown.fill")
-                    .font(.subheadline.weight(.semibold))
-                    .foregroundStyle(Color.accentColor)
-                caption("Fade, blend modes, color trails and ignore-region masks.")
-                Button("Unlock Premium") { showPaywall = true }
-                    .buttonStyle(PrimaryButtonStyle())
+            VStack(alignment: .leading, spacing: 8) {
+                panelRow("Fade", value: fadeSecondsValue)
+                Slider(value: $settings.fadeSeconds, in: 0...10, step: 0.25)
+                    .accessibilityLabel("Trail fade")
+                    .accessibilityValue(fadeSecondsValue)
+                scaleLabels("Off", "10 s")
+                caption(settings.fadeSeconds > 0
+                        ? "Each mark fades back into the background \(fadeSecondsValue) after it's left."
+                        : "Trails stay for the whole clip.")
+            }
+            VStack(alignment: .leading, spacing: 8) {
+                panelRow("Color", value: nil)
+                optionChips(RenderSettings.ColorStyle.allCases, selection: $settings.colorStyle) { $0.label }
+                if settings.colorStyle == .ageGradient {
+                    HStack(spacing: 20) {
+                        ColorPicker("Start", selection: gradientColorBinding(\.gradientNewest), supportsOpacity: false)
+                        ColorPicker("End", selection: gradientColorBinding(\.gradientOldest), supportsOpacity: false)
+                    }
+                    .font(.subheadline)
+                    panelRow("Shift over", value: gradientShiftValue)
+                    Slider(value: $settings.gradientShiftSeconds, in: 0.5...10, step: 0.25)
+                        .accessibilityLabel("Gradient shift time")
+                        .accessibilityValue(gradientShiftValue)
+                    scaleLabels("Fast shift", "Slow shift")
+                    caption("Trails appear in the start colour and reach the end colour \(gradientShiftValue) later.")
+                }
+            }
+            VStack(alignment: .leading, spacing: 8) {
+                panelRow("Handheld camera", value: nil)
+                optionChips(RenderSettings.HandheldLevel.allCases, selection: $settings.handheldLevel) { $0.label }
+                caption("Makes the tripod shot read as handheld — slow sway, framing nudges and hand tremor. The canvas previews it live.")
+                if settings.handheldLevel != .none {
+                    Toggle(isOn: $settings.handheldParallax) {
+                        Text("Depth parallax").font(.subheadline)
+                    }
+                    .tint(Color.accentColor)
+                    .padding(.top, 2)
+                    caption("Larger, nearer-looking trail marks sway progressively more than small distant ones and can reveal what's behind them. Shows in the export — the canvas preview sways as one.")
+                }
             }
         }
     }
@@ -394,6 +431,25 @@ struct RenderView: View {
 
     private func caption(_ text: String) -> some View {
         Text(text).font(.caption).foregroundStyle(.secondary)
+    }
+
+    /// Two-way bridge between a settings gradient colour and SwiftUI's `ColorPicker`.
+    private func gradientColorBinding(
+        _ keyPath: WritableKeyPath<RenderSettings, RenderSettings.GradientColor>
+    ) -> Binding<Color> {
+        Binding(
+            get: {
+                let c = settings[keyPath: keyPath]
+                return Color(red: c.red, green: c.green, blue: c.blue)
+            },
+            set: { color in
+                var r: CGFloat = 0, g: CGFloat = 0, b: CGFloat = 0, a: CGFloat = 0
+                UIColor(color).getRed(&r, green: &g, blue: &b, alpha: &a)
+                settings[keyPath: keyPath] = RenderSettings.GradientColor(
+                    red: Double(min(max(r, 0), 1)),
+                    green: Double(min(max(g, 0), 1)),
+                    blue: Double(min(max(b, 0), 1)))
+            })
     }
 
     private func optionChips<T: Hashable>(_ options: [T], selection: Binding<T>,
@@ -431,13 +487,19 @@ struct RenderView: View {
 
             switch phase {
             case .edit:
-                if monetization.watermarkEnabled {
-                    UpsellChip(text: "Free exports include a watermark — remove") { showPaywall = true }
-                }
                 Button { startRender() } label: {
                     Label("Generate · \(clipLengthText) clip", systemImage: "sparkles")
                 }
                 .buttonStyle(PrimaryButtonStyle())
+                if let lastResultURL {
+                    Button("View last result") {
+                        Theme.Haptics.tap()
+                        saveState = .idle
+                        withAnimation(.spring(duration: 0.35)) { phase = .result(lastResultURL) }
+                    }
+                    .font(.subheadline)
+                    .foregroundStyle(Color.accentColor)
+                }
 
             case .rendering:
                 Button("Cancel", role: .cancel) { renderTask?.cancel() }
@@ -448,9 +510,6 @@ struct RenderView: View {
                     .background(Theme.surfaceBright, in: RoundedRectangle(cornerRadius: Theme.cornerRadius))
 
             case .result(let url):
-                if monetization.watermarkEnabled {
-                    UpsellChip(text: "This export has a watermark — remove") { showPaywall = true }
-                }
                 HStack(spacing: 10) {
                     Button { saveToPhotos(url) } label: {
                         Label(saveLabel, systemImage: saveState == .saved ? "checkmark.circle.fill" : "square.and.arrow.down")
@@ -491,6 +550,17 @@ struct RenderView: View {
         return s < 1 ? String(format: "%.2f s", s) : String(format: "%.1f s", s)
     }
 
+    private var fadeSecondsValue: String {
+        settings.fadeSeconds > 0 ? Self.secondsText(settings.fadeSeconds) : "Off"
+    }
+
+    private var gradientShiftValue: String { Self.secondsText(settings.gradientShiftSeconds) }
+
+    /// Shortest decimal form for the 0.25 s-stepped sliders: "2 s", "2.5 s", "2.75 s".
+    private static func secondsText(_ seconds: Double) -> String {
+        String(format: "%g s", seconds)
+    }
+
     private var saveLabel: String {
         switch saveState {
         case .idle, .failed: return "Save to Photos"
@@ -502,20 +572,17 @@ struct RenderView: View {
     // MARK: - Preview preparation
 
     /// Settings that change the per-frame mask and therefore need the preview re-prepared:
-    /// contrast mode, the motion horizon, and ignore regions (now baked into the proxy layers).
-    /// Everything else (frequency, blend, fade, color, backdrop) is a cheap `recompose`.
+    /// contrast mode, the motion horizon, and ignore regions/strokes (baked into the proxy
+    /// layers). Everything else (frequency, blend, fade, color, backdrop) is a cheap `recompose`.
     private func maskKey(_ s: RenderSettings) -> String {
-        let regions = s.ignoreRegions.map {
-            String(format: "%.3f,%.3f,%.3f,%.3f", $0.minX, $0.minY, $0.width, $0.height)
-        }.joined(separator: ";")
-        return "\(s.contrastMode.rawValue)|\(Int((s.motionHorizonSeconds * 100).rounded()))|\(regions)"
+        "\(s.contrastMode.rawValue)|\(Int((s.motionHorizonSeconds * 100).rounded()))|\(s.ignoreFingerprint)"
     }
 
     private func schedulePrepare() {
         prepareTask?.cancel()
         let url = sourceURL
         let settings = settings
-        let cacheDir = store.directory(for: project)
+        let cacheDir = store.previewCacheDirectory(for: project)
         prepareTask = Task {
             try? await Task.sleep(nanoseconds: 400_000_000)
             if Task.isCancelled { return }
@@ -557,14 +624,22 @@ struct RenderView: View {
         let url = sourceURL
         let projectID = project.id
         let store = store
-        let watermark = monetization.watermarkEnabled
-        let maxDimension = monetization.maxOutputDimension
 
         renderTask = Task {
+            // Keep rendering for a bounded window if the user backgrounds the app mid-render,
+            // instead of having the task killed non-deterministically. The engine cleans up its
+            // own temp file on throw/cancel, so a killed render leaks nothing.
+            let bgTask = await MainActor.run {
+                UIApplication.shared.beginBackgroundTask(withName: "trail-render")
+            }
+            defer {
+                Task { @MainActor in
+                    if bgTask != .invalid { UIApplication.shared.endBackgroundTask(bgTask) }
+                }
+            }
             do {
                 let outputURL = try await engine.render(sourceURL: url, settings: settings,
-                                                        watermark: watermark,
-                                                        maxOutputDimension: maxDimension) { fraction in
+                                                        maxOutputDimension: Self.maxOutputDimension) { fraction in
                     Task { @MainActor in progress = fraction }
                 } stage: { stage in
                     Task { @MainActor in renderStage = stage }
@@ -580,6 +655,7 @@ struct RenderView: View {
                         try? FileManager.default.removeItem(at: outputURL)
                     }
                     saveState = .idle
+                    lastResultURL = playable
                     withAnimation(.spring(duration: 0.35)) { phase = .result(playable) }
                     Theme.Haptics.success()
                 }
@@ -612,6 +688,35 @@ struct RenderView: View {
                     Theme.Haptics.failure()
                 }
             }
+        }
+    }
+}
+
+/// Animates the editor canvas with the same `HandheldMotion` noise the engine bakes into the
+/// export, so the Handheld slider can be *felt* live — a still can't show motion. Pure view-layer
+/// transforms (no Core Image work); the `clipShape` applied after this modifier keeps the moving,
+/// overscanned content inside the canvas frame, exactly like the engine's crop.
+private struct HandheldPreviewShake: ViewModifier {
+    let amount: Double
+
+    @ViewBuilder
+    func body(content: Content) -> some View {
+        if amount > 0 {
+            TimelineView(.animation(minimumInterval: 1.0 / 30.0)) { timeline in
+                let motion = HandheldMotion(intensity: amount)
+                let pose = motion.pose(at: timeline.date.timeIntervalSinceReferenceDate)
+                content.visualEffect { effect, proxy in
+                    // Engine poses are y-up with CCW angles; the view is y-down with clockwise
+                    // angles — negate both so the sway matches the render visually.
+                    effect
+                        .scaleEffect(motion.overscan(for: proxy.size))
+                        .rotationEffect(.radians(-pose.roll))
+                        .offset(x: pose.offsetX * proxy.size.width,
+                                y: -pose.offsetY * proxy.size.width)
+                }
+            }
+        } else {
+            content
         }
     }
 }

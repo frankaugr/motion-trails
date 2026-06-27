@@ -87,23 +87,33 @@ final class VideoFrameWriter {
 
     /// Appends a buffer produced by `makeFrameBuffer` at the next fixed-rate presentation time,
     /// waiting for the encoder to drain if it has fallen behind.
-    func append(_ buffer: CVPixelBuffer) async {
-        await waitUntilReady()
+    func append(_ buffer: CVPixelBuffer) async throws {
+        try await waitUntilReady()
         let pts = CMTimeMultiply(frameDuration, multiplier: Int32(truncatingIfNeeded: frameIndex))
-        adaptor.append(buffer, withPresentationTime: pts)
+        guard adaptor.append(buffer, withPresentationTime: pts) else {
+            throw VideoIOError.writerFailed(writer.error)
+        }
         frameIndex += 1
     }
 
-    func finish() async {
+    func finish() async throws {
         input.markAsFinished()
         await withCheckedContinuation { continuation in
             writer.finishWriting { continuation.resume() }
         }
+        if writer.status != .completed {
+            throw VideoIOError.writerFailed(writer.error)
+        }
     }
 
-    private func waitUntilReady() async {
+    /// Spins until the encoder can take more data — but bails the moment the writer enters
+    /// `.failed`, so a codec/disk error surfaces as a thrown error instead of an infinite loop and
+    /// a permanently-hung progress bar. A cancelled render also breaks out via `Task.sleep`.
+    private func waitUntilReady() async throws {
         while !input.isReadyForMoreMediaData {
-            try? await Task.sleep(nanoseconds: 2_000_000) // 2 ms
+            if writer.status == .failed { throw VideoIOError.writerFailed(writer.error) }
+            try await Task.sleep(nanoseconds: 2_000_000) // 2 ms
         }
+        if writer.status == .failed { throw VideoIOError.writerFailed(writer.error) }
     }
 }

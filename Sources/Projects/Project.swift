@@ -38,6 +38,25 @@ struct Project: Codable, Identifiable, Equatable, Hashable {
         self.sourceDuration = sourceDuration
     }
 
+    private enum CodingKeys: String, CodingKey {
+        case id, createdAt, name, sourceFilename, thumbnailFilename, settings, exportFilenames, sourceDuration
+    }
+
+    /// Forgiving decode (mirrors `RenderSettings.init(from:)`): every field falls back to a default
+    /// rather than throwing, so adding a field in a future schema — or an old manifest missing one —
+    /// never drops the project from the library. Encoding stays synthesized.
+    init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        id = (try? c.decode(UUID.self, forKey: .id)) ?? UUID()
+        createdAt = (try? c.decode(Date.self, forKey: .createdAt)) ?? Date()
+        name = try? c.decode(String.self, forKey: .name)
+        sourceFilename = (try? c.decode(String.self, forKey: .sourceFilename)) ?? "source.mov"
+        thumbnailFilename = try? c.decode(String.self, forKey: .thumbnailFilename)
+        settings = (try? c.decode(RenderSettings.self, forKey: .settings)) ?? RenderSettings()
+        exportFilenames = (try? c.decode([String].self, forKey: .exportFilenames)) ?? []
+        sourceDuration = (try? c.decode(Double.self, forKey: .sourceDuration)) ?? 0
+    }
+
     var hasExport: Bool { !exportFilenames.isEmpty }
 
     /// Library/editor title: the user's name for the project, falling back to the capture date.

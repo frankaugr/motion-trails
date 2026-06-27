@@ -9,6 +9,12 @@ struct CameraPreview: UIViewRepresentable {
         let view = PreviewView()
         view.videoPreviewLayer.session = session
         view.videoPreviewLayer.videoGravity = .resizeAspectFill
+        // Capture is portrait-only; pin the live preview to portrait so it matches the
+        // recording connection (CaptureService) and never appears rotated.
+        if let connection = view.videoPreviewLayer.connection,
+           connection.isVideoRotationAngleSupported(90) {
+            connection.videoRotationAngle = 90
+        }
         return view
     }
 

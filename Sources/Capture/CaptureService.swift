@@ -21,12 +21,13 @@ final class CaptureService: NSObject, AVCaptureFileOutputRecordingDelegate {
     private(set) var permissionDenied = false
     private(set) var lightingWarning: String?
 
-    /// Hard recording cap (seconds). Driven by the free/premium entitlement (spec §7.1).
-    var maxRecordingDuration: Double = 5 {
+    /// Hard recording cap (seconds, spec §7.1) — keeps clips inside what the render engine
+    /// handles comfortably (memory and render time grow with clip length).
+    var maxRecordingDuration: Double = 60 {
         didSet { sessionQueue.async { self.applyMaxDuration() } }
     }
 
-    /// Premium + capable devices capture at 4K; otherwise 1080p (spec §8, §16). Set before `configure`.
+    /// Capable devices capture at 4K; otherwise 1080p (spec §8, §16). Set before `configure`.
     var prefersHighestResolution = false
 
     // MARK: - Setup
@@ -69,6 +70,15 @@ final class CaptureService: NSObject, AVCaptureFileOutputRecordingDelegate {
         }
         if session.canAddOutput(movieOutput) { session.addOutput(movieOutput) }
 
+        // Capture is portrait-only (the screen is locked to portrait while recording). Pin the
+        // recording connection to portrait so the written clip is upright regardless of the
+        // sensor's native landscape orientation. The engine still normalizes via the file's
+        // preferredTransform on decode, so this stays consistent with that path.
+        if let connection = movieOutput.connection(with: .video),
+           connection.isVideoRotationAngleSupported(90) {
+            connection.videoRotationAngle = 90
+        }
+
         selectBestFormat(for: camera)
         applyMaxDuration()
     }
@@ -76,7 +86,7 @@ final class CaptureService: NSObject, AVCaptureFileOutputRecordingDelegate {
     /// Picks the 1080p format with the highest supported frame rate and locks the active frame
     /// rate to it (capability-gated; spec §5, §23 60fps target).
     private func selectBestFormat(for device: AVCaptureDevice) {
-        // Premium + capable: prefer 2160p; otherwise (or as fallback) the best 1080p.
+        // Capable devices: prefer 2160p; otherwise (or as fallback) the best 1080p.
         let targetHeight: Int32 = prefersHighestResolution ? 2160 : 1080
         var best: AVCaptureDevice.Format?
         var bestFPS = 0.0

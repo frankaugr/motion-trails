@@ -1,11 +1,11 @@
 import SwiftUI
+import UIKit
 
 /// Capture screen (spec §12.1): live camera, record button with a countdown ring against the
-/// gated max duration, pre-record stability check, framing grid + level, and a low-light
-/// warning. On finish it creates a project and hands it back via `onCaptured`.
+/// max duration, pre-record stability check, framing grid + level, and a low-light warning.
+/// On finish it creates a project and hands it back via `onCaptured`.
 struct CaptureView: View {
     @Environment(ProjectStore.self) private var store
-    @Environment(MonetizationStore.self) private var monetization
     @Environment(\.dismiss) private var dismiss
 
     var onCaptured: (Project) -> Void
@@ -17,7 +17,6 @@ struct CaptureView: View {
     @State private var isSaving = false
     @State private var errorMessage: String?
     @State private var showGrid = true
-    @State private var showPaywall = false
 
     var body: some View {
         ZStack {
@@ -36,18 +35,31 @@ struct CaptureView: View {
             }
         }
         .task {
-            capture.maxRecordingDuration = monetization.maxRecordingDuration
+            lockToPortrait(true)
             await capture.configure()
             capture.startRunning()
             capture.lockSettings()
             stability.start()
         }
         .onDisappear {
+            lockToPortrait(false)
             ticker?.invalidate()
             capture.stopRunning()
             stability.stop()
         }
-        .sheet(isPresented: $showPaywall) { PaywallView() }
+    }
+
+    /// Capture is portrait-only (the recording/preview connections are pinned to portrait in
+    /// `CaptureService`/`CameraPreview`). Constrain the whole screen so the user can't rotate it
+    /// into a state the camera pipeline doesn't handle, then release it on the way out.
+    private func lockToPortrait(_ on: Bool) {
+        AppDelegate.orientationLock = on ? .portrait : .all
+        let scene = UIApplication.shared.connectedScenes
+            .first { $0.activationState == .foregroundActive } as? UIWindowScene
+            ?? UIApplication.shared.connectedScenes.first as? UIWindowScene
+        guard let scene else { return }
+        scene.requestGeometryUpdate(.iOS(interfaceOrientations: on ? .portrait : .all))
+        scene.keyWindow?.rootViewController?.setNeedsUpdateOfSupportedInterfaceOrientations()
     }
 
     // MARK: - Overlays
@@ -95,15 +107,9 @@ struct CaptureView: View {
 
                 recordButton
 
-                if monetization.isPremium {
-                    Text("Up to \(Int(monetization.premiumRecordingLimit))s")
-                        .font(.caption)
-                        .foregroundStyle(.white.opacity(0.85))
-                } else {
-                    UpsellChip(text: "Free: \(Int(monetization.freeRecordingLimit))s · unlock \(Int(monetization.premiumRecordingLimit))s") {
-                        showPaywall = true
-                    }
-                }
+                Text("Up to \(Int(capture.maxRecordingDuration))s")
+                    .font(.caption)
+                    .foregroundStyle(.white.opacity(0.85))
             }
             .padding(.bottom, 28)
 
@@ -150,9 +156,9 @@ struct CaptureView: View {
         } label: {
             ZStack {
                 Circle().stroke(.white.opacity(0.5), lineWidth: 4).frame(width: 76, height: 76)
-                // Countdown ring: fills as the recording approaches the tier's cap.
+                // Countdown ring: fills as the recording approaches the cap.
                 Circle()
-                    .trim(from: 0, to: capture.isRecording ? min(1, elapsed / monetization.maxRecordingDuration) : 0)
+                    .trim(from: 0, to: capture.isRecording ? min(1, elapsed / capture.maxRecordingDuration) : 0)
                     .stroke(Color.accentColor, style: StrokeStyle(lineWidth: 4, lineCap: .round))
                     .rotationEffect(.degrees(-90))
                     .frame(width: 76, height: 76)
@@ -185,7 +191,15 @@ struct CaptureView: View {
             Text("Enable camera access in Settings to record clips.")
                 .font(.subheadline).foregroundStyle(.white.opacity(0.8))
                 .multilineTextAlignment(.center)
-            Button("Close") { dismiss() }.buttonStyle(PrimaryButtonStyle())
+            Button("Open Settings") {
+                if let url = URL(string: UIApplication.openSettingsURLString) {
+                    UIApplication.shared.open(url)
+                }
+            }
+            .buttonStyle(PrimaryButtonStyle())
+            Button("Close") { dismiss() }
+                .font(.subheadline)
+                .foregroundStyle(.white.opacity(0.8))
         }
         .padding(32)
     }
@@ -199,7 +213,7 @@ struct CaptureView: View {
     }
 
     private var timeLabel: String {
-        String(format: "%.1f / %ds", elapsed, Int(monetization.maxRecordingDuration))
+        String(format: "%.1f / %ds", elapsed, Int(capture.maxRecordingDuration))
     }
 
     private func startRecording() {
@@ -207,7 +221,7 @@ struct CaptureView: View {
         elapsed = 0
         errorMessage = nil
         ticker = Timer.scheduledTimer(withTimeInterval: 0.1, repeats: true) { _ in
-            elapsed = min(elapsed + 0.1, monetization.maxRecordingDuration)
+            elapsed = min(elapsed + 0.1, capture.maxRecordingDuration)
         }
         Task {
             do {

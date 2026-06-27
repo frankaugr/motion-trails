@@ -15,10 +15,11 @@ import Observation
 @Observable
 final class TrailPreviewRenderer {
     private(set) var previewImage: CGImage?
-    /// Plain source still (the live backdrop frame) for the editor's hold-to-compare gesture.
-    private(set) var sourceImage: CGImage?
     private(set) var isPreparing = false
     private(set) var isReady = false
+    /// Set when `prepare` throws (e.g. an unreadable/corrupt source) so the UI can show a real
+    /// message + retry instead of a permanent "Preparing preview…" spinner.
+    private(set) var preparationFailed = false
 
     private var background: CIImage?          // frozen plate (temporal median)
     private var liveBackground: CIImage?      // live backdrop (last snapshot frame) for `.live` mode
@@ -36,7 +37,9 @@ final class TrailPreviewRenderer {
     // v2: temporal (fast-vs-slow) detection replaced static-background differencing.
     // v3: cache now also carries a live backdrop (Frozen/Live background toggle).
     // v4: ignore regions are baked into the layers; cache moved to per-key subdirectories (LRU).
-    private let cacheVersion = 4
+    // v5: ignore brush strokes + feathered keep-mask edges.
+    // v6: both-or-nothing temporal pair (no one-sided ghosts at clip ends) + r1 despeckle open.
+    private let cacheVersion = 6
 
     private var recomposeTask: Task<Void, Never>?
 
@@ -54,7 +57,10 @@ final class TrailPreviewRenderer {
     /// setting (contrast mode, stabilization, background mode) changes. `cacheDirectory` (the project
     /// directory) enables the on-disk cache; pass `nil` to always recompute.
     func prepare(sourceURL: URL, settings: RenderSettings, cacheDirectory: URL? = nil) async {
-        await MainActor.run { isPreparing = true }
+        await MainActor.run {
+            isPreparing = true
+            preparationFailed = false
+        }
         let key = cacheKey(settings)
 
         // Fast path: reuse a previously prepared preview for these mask settings.
@@ -70,7 +76,10 @@ final class TrailPreviewRenderer {
             await apply(data)
             recompose(settings: settings)
         } catch {
-            await MainActor.run { self.isPreparing = false }
+            await MainActor.run {
+                self.isPreparing = false
+                self.preparationFailed = true
+            }
         }
     }
 
@@ -80,9 +89,9 @@ final class TrailPreviewRenderer {
         layers = data.layers
         proxyRect = data.proxyRect
         clipDurationSeconds = data.durationSeconds
-        sourceImage = context.createCGImage(data.liveBackground, from: data.proxyRect)
         isPreparing = false
         isReady = true
+        preparationFailed = false
     }
 
     // MARK: - Compute (single decode pass, proxy resolution)
@@ -117,7 +126,8 @@ final class TrailPreviewRenderer {
         let extractor = SubjectLayerExtractor()
         // Ignore regions are cut out of every proxy layer (same keep-mask the engine multiplies
         // into its motion mask), so masked areas show no trails in the preview either.
-        let keepAlpha = IgnoreMaskBuilder.keepMask(regions: settings.ignoreRegions, size: pSize)
+        let keepAlpha = IgnoreMaskBuilder.keepMask(regions: settings.ignoreRegions,
+                                                   strokes: settings.ignoreStrokes, size: pSize)
             .map(Self.maskToAlpha)
 
         func image(_ buf: [UInt8]) -> CIImage {
@@ -131,16 +141,27 @@ final class TrailPreviewRenderer {
         var snapshots: [[UInt8]] = []   // kept snapshot (centre) buffers — feed the plate
         var layers: [CIImage] = []
 
-        func neighbour(_ bi: Int) -> CIImage? {
-            guard bi >= ringStart, bi - ringStart < ring.count else { return nil }
-            return image(ring[bi - ringStart])
+        // Nearest ring frame on one side of the centre, scanning *inward* from ±K — at the clip's
+        // ends the horizon shrinks instead of the side vanishing. Like the engine, the pair is
+        // used both-or-nothing: a one-sided difference leaves the trailing "ghost" the symmetric
+        // min removes, which cut sky-coloured ghost layers at the first/last snapshots.
+        func temporalReference(centre bi: Int, step: Int) -> CIImage? {
+            var gi = bi + step * horizon
+            while gi != bi {
+                if gi >= ringStart, gi - ringStart < ring.count { return image(ring[gi - ringStart]) }
+                gi -= step
+            }
+            return nil
         }
         func emitCentre(_ bi: Int) {
             guard layers.count < maxSnapshots, bi >= ringStart, bi - ringStart < ring.count else { return }
             let centre = ring[bi - ringStart]
+            let earlier = temporalReference(centre: bi, step: -1)
+            let later = temporalReference(centre: bi, step: +1)
+            let bothSides = earlier != nil && later != nil
             var layer = extractor.subjectLayer(frame: image(centre),
-                                               earlier: neighbour(bi - horizon),
-                                               later: neighbour(bi + horizon),
+                                               earlier: bothSides ? earlier : nil,
+                                               later: bothSides ? later : nil,
                                                settings: settings, radiusScale: scale)
             if let keepAlpha {
                 layer = Self.blendWithMask(foreground: layer, background: CIImage.empty(),
@@ -195,11 +216,12 @@ final class TrailPreviewRenderer {
     /// Recomposite the selected snapshot subset for the current frequency, trail mode, fade and
     /// color style. Cheap; safe to call on every slider change.
     ///
-    /// Fade/color parity: the engine fades its age map by `ageDecay` per output frame and (for
-    /// `.ageGradient`) replaces trail pixels with the age-mapped gradient color. The preview shows
-    /// the *final* frame, so each snapshot's age there is `decay^(framesSinceSnapshot)` — applied
-    /// here as a per-layer opacity (the engine's fade blends the trail toward the backdrop by
-    /// exactly that age value) and as a per-layer tint along the same gradient.
+    /// Fade/color parity: the engine fades its age map by `ageDecay` per output frame, its colour-age
+    /// map by `gradientDecay`, and (for `.ageGradient`) replaces trail pixels with the colour-age-
+    /// mapped gradient. The preview shows the *final* frame, so each snapshot's ages there are
+    /// `decay^(framesSinceSnapshot)` — the fade age applied as a per-layer opacity (the engine's fade
+    /// blends the trail toward the backdrop by exactly that value), the colour age as a per-layer
+    /// tint along the settings' gradient endpoints.
     func recompose(settings: RenderSettings) {
         recomposeTask?.cancel()
         let layers = self.layers
@@ -209,6 +231,9 @@ final class TrailPreviewRenderer {
         let mode = settings.trailMode
         let decay = settings.ageDecay
         let gradientTint = settings.colorStyle == .ageGradient
+        let colorDecay = settings.gradientDecay
+        let oldest = settings.gradientOldest
+        let newest = settings.gradientNewest
         let framesPerSnapshot = settings.snapshotIntervalSeconds * Double(settings.outputFPS)
         // Frozen plate vs. live scene — the toggle is just which backdrop the layers sit over.
         let backdrop = settings.backgroundMode == .live ? (liveBackground ?? background) : background
@@ -217,25 +242,28 @@ final class TrailPreviewRenderer {
             let selected = Self.evenlySpaced(layers, count: count)
             var composite = backdrop
 
-            func styled(_ layer: CIImage, age: Double) -> CIImage {
+            func styled(_ layer: CIImage, framesSinceSnapshot: Double) -> CIImage {
                 var out = layer
-                if gradientTint { out = Self.tinted(out, color: Self.gradientColor(age)) }
+                if gradientTint {
+                    let colorAge = pow(colorDecay, framesSinceSnapshot)
+                    out = Self.tinted(out, color: Self.gradientColor(colorAge, oldest: oldest, newest: newest))
+                }
                 var opacity = mode == .overlay ? 0.5 : 1.0
-                if decay < 1 { opacity *= age }
+                if decay < 1 { opacity *= pow(decay, framesSinceSnapshot) }
                 if opacity < 1 { out = Self.scaledAlpha(out, opacity) }
                 return out
             }
 
             for (i, layer) in selected.enumerated() {
-                let age = decay < 1 || gradientTint
-                    ? pow(decay, Double(selected.count - 1 - i) * framesPerSnapshot)
-                    : 1.0
-                composite = styled(layer, age: age).composited(over: composite)
+                composite = styled(layer, framesSinceSnapshot: Double(selected.count - 1 - i) * framesPerSnapshot)
+                    .composited(over: composite)
             }
             // Draw the final frame's subject on top — the engine shows the live subject on the last
             // frame, so this keeps the preview matching the rendered video's final frame.
             if let last = layers.last {
-                let live = gradientTint ? Self.tinted(last, color: Self.gradientColor(1)) : last
+                let live = gradientTint
+                    ? Self.tinted(last, color: Self.gradientColor(1, oldest: oldest, newest: newest))
+                    : last
                 composite = live.composited(over: composite)
             }
             let cg = context.createCGImage(composite, from: rect)
@@ -251,10 +279,7 @@ final class TrailPreviewRenderer {
     /// baked into the layers, so they are part of the key.
     private func cacheKey(_ settings: RenderSettings) -> String {
         let h = Int((settings.motionHorizonSeconds * 100).rounded())
-        let regions = settings.ignoreRegions
-            .map { String(format: "%.3f,%.3f,%.3f,%.3f", $0.minX, $0.minY, $0.width, $0.height) }
-            .joined(separator: ";")
-        return "v\(cacheVersion)|\(settings.contrastMode.rawValue)|h\(h)|e\(Int(maxProxyEdge))|n\(maxSnapshots)|ir\(Self.stableHash(regions))"
+        return "v\(cacheVersion)|\(settings.contrastMode.rawValue)|h\(h)|e\(Int(maxProxyEdge))|n\(maxSnapshots)|ir\(Self.stableHash(settings.ignoreFingerprint))"
     }
 
     /// Stable (FNV-1a) hex digest — `Hasher` is seeded per launch, so it can't key an on-disk cache.
@@ -417,14 +442,14 @@ final class TrailPreviewRenderer {
         return m.outputImage ?? image
     }
 
-    /// Linear blend along the engine's age gradient (`age` 1 = newest, 0 = oldest).
-    private static func gradientColor(_ age: Double) -> CIColor {
-        let t = CGFloat(min(max(age, 0), 1))
-        let old = TrailColorizer.oldestColor
-        let new = TrailColorizer.newestColor
-        return CIColor(red: old.red + (new.red - old.red) * t,
-                       green: old.green + (new.green - old.green) * t,
-                       blue: old.blue + (new.blue - old.blue) * t)
+    /// Linear blend along the age gradient (`age` 1 = newest, 0 = oldest) — the preview analogue of
+    /// the engine's `TrailColorizer` colour map, sharing the settings' endpoints.
+    private static func gradientColor(_ age: Double, oldest: RenderSettings.GradientColor,
+                                      newest: RenderSettings.GradientColor) -> CIColor {
+        let t = min(max(age, 0), 1)
+        return CIColor(red: oldest.red + (newest.red - oldest.red) * t,
+                       green: oldest.green + (newest.green - oldest.green) * t,
+                       blue: oldest.blue + (newest.blue - oldest.blue) * t)
     }
 
     private static func maskToAlpha(_ grayscale: CIImage) -> CIImage {
