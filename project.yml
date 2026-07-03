@@ -10,7 +10,7 @@ settings:
   base:
     SWIFT_VERSION: "5.0"
     MARKETING_VERSION: "1.0.0"
-    CURRENT_PROJECT_VERSION: "1"
+    CURRENT_PROJECT_VERSION: "2"
     CODE_SIGN_STYLE: Automatic
     DEVELOPMENT_TEAM: 9GFD8R88ZJ
     TARGETED_DEVICE_FAMILY: "1,2"
@@ -36,7 +36,7 @@ targets:
         CFBundleVersion: "$(CURRENT_PROJECT_VERSION)"
         ITSAppUsesNonExemptEncryption: false
         UILaunchScreen:
-          UIColorName: ""
+          UIColorName: LaunchBackground
         NSPhotoLibraryAddUsageDescription: "Motion Trails saves your finished trail videos to your photo library."
         NSCameraUsageDescription: "Motion Trails uses the camera to record short clips for trail effects."
         UISupportedInterfaceOrientations:

@@ -1,9 +1,9 @@
 # macOS
 .DS_Store
 
-# Xcode / build artifacts
+# Xcode / build artifacts (root only — marketing/ has its own ignore rules)
 DerivedData/
-build/
+/build/
 *.xcuserstate
 *.xcuserdatad
 

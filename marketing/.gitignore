@@ -1,2 +1,4 @@
 # Scratch / intermediates — regenerable from scripts/ + the source clip.
 work/
+# Engine trail render (the "after" footage) — regenerable via scripts/02_render_trails.sh.
+build/
