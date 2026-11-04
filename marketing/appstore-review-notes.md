@@ -34,7 +34,8 @@ slow camera shutter. It solves a problem that normally requires a dedicated came
 tripod and desktop editing: Motion Trails produces the effect from an ordinary iPhone clip in a few
 taps. Target audience: hobbyist and enthusiast photographers and videographers, birdwatchers and
 wildlife fans, cyclists/runners/action-sports creators, and social-media creators who want a
-distinctive motion effect. The app is free, with every feature unlocked.
+distinctive motion effect. The app is a one-time paid purchase with every feature included —
+there are no in-app purchases or subscriptions.
 
 **How to set up and access the main features (item 4)**
 No account, login, or credentials are required — the app works fully offline on first launch.
@@ -76,8 +77,10 @@ Minimum deployment target: iOS 18.0. The app requires no network connection.
   testing heavily, and you need a device for the screen recording anyway — record on the same device
   and list it here. If you haven't run it on hardware yet, do that first (directly or via TestFlight).
 - **Privacy / App Privacy** is already consistent with this: "Data Not Collected", no tracking.
-- **Possible next-round watch-item (Guideline 2.3.3):** your App Store *screenshots* are promotional
-  (styled frames + headlines) rather than literal in-app captures. They show the real rendered effect,
-  but a reviewer could ask for screenshots that show the app UI "in use." If that comes up, we can drop
-  one or two real in-app captures (pulled from your device recording) into the existing promo frames so
-  they stay polished but clearly show the app. Not required now — the current rejection is 2.1 only.
+- **Possible next-round watch-item (Guideline 2.3.3):** the App Store *screenshots* are promotional
+  (styled frames + headlines) rather than literal in-app captures. Mitigated in the current set: three
+  of the six screens show the editor's real control panels (Trails / Motion / Effects, recreated 1:1
+  from `RenderView`), and the iPad `03_tune` is an actual frame from your physical-iPad screen
+  recording (`marketing/source/captures/`). If a reviewer still asks for literal captures, the other
+  frames in that folder (Motion panel, result, capture, library) drop straight into the same frames.
+  Not required now — the current rejection is 2.1 only.

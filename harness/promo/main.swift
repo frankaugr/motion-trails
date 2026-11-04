@@ -11,9 +11,13 @@ import Foundation
 //
 //   swiftc -swift-version 5 Sources/Engine/*.swift harness/promo/main.swift -o /tmp/promorender
 //   /tmp/promorender <input.mp4> <output.mp4> [contrast=silhouette] [horizon=0.25] [freq=0.8] \
-//       [fade=0] [bg=frozen] [mode=trail] [maxdim=1920]
+//       [fade=0] [bg=frozen] [mode=trail] [maxdim=1920] \
+//       [color=natural] [shift=2] [handheld=0] [parallax=0]
 //
 // contrast: any|silhouette|highlight|colour   mode: trail|mask   bg: frozen|live
+// color: natural|gradient (age gradient, app-default orange → blue; shift = seconds to reach the
+// end colour)   handheld: 0…1 sway amount (None/Low/Medium/High = 0/0.25/0.55/1.0)
+// parallax: 0|1 depth parallax (only meaningful with handheld > 0)
 
 let args = CommandLine.arguments
 guard args.count >= 3 else {
@@ -38,8 +42,10 @@ settings.motionHorizonSeconds = dbl("horizon", 0.25)
 settings.trailFrequency = dbl("freq", 0.8)
 settings.fadeSeconds = dbl("fade", 0)
 settings.backgroundMode = RenderSettings.BackgroundMode(rawValue: str("bg", "static")) ?? .frozen
-settings.colorStyle = .natural
-settings.handheldAmount = 0
+settings.colorStyle = (str("color", "natural") == "gradient") ? .ageGradient : .natural
+settings.gradientShiftSeconds = dbl("shift", 2)
+settings.handheldAmount = min(max(dbl("handheld", 0), 0), 1)
+settings.handheldParallax = dbl("parallax", 0) > 0
 
 let outputMode: TrailRenderEngine.Output = (str("mode", "trail") == "mask") ? .mask : .trail
 let maxDim = CGFloat(dbl("maxdim", 1920))
@@ -49,7 +55,9 @@ func run() async throws {
     print("Rendering \(inURL.lastPathComponent) -> \(outURL.lastPathComponent)")
     print("  contrast=\(settings.contrastMode.rawValue) horizon=\(settings.motionHorizonSeconds) " +
           "freq=\(settings.trailFrequency) fade=\(settings.fadeSeconds) " +
-          "bg=\(settings.backgroundMode.rawValue) mode=\(str("mode", "trail")) maxdim=\(Int(maxDim))")
+          "bg=\(settings.backgroundMode.rawValue) mode=\(str("mode", "trail")) maxdim=\(Int(maxDim)) " +
+          "color=\(settings.colorStyle.rawValue) shift=\(settings.gradientShiftSeconds) " +
+          "handheld=\(settings.handheldAmount) parallax=\(settings.handheldParallax)")
 
     var lastPct = -1
     let produced = try await TrailRenderEngine().render(
