@@ -39,7 +39,9 @@ final class TrailPreviewRenderer {
     // v4: ignore regions are baked into the layers; cache moved to per-key subdirectories (LRU).
     // v5: ignore brush strokes + feathered keep-mask edges.
     // v6: both-or-nothing temporal pair (no one-sided ghosts at clip ends) + r1 despeckle open.
-    private let cacheVersion = 6
+    // v7: snapshot stride rounds up (layers span the whole clip, not just its first 96 frames) and
+    //     proxies/layers are stored sRGB-encoded instead of 8-bit linear.
+    private let cacheVersion = 7
 
     private var recomposeTask: Task<Void, Never>?
 
@@ -119,10 +121,14 @@ final class TrailPreviewRenderer {
         // not an adjacent-sample approximation. Only ~2K+2 proxy buffers are resident at once; the
         // kept layers stay GPU-resident.
         try reader.start()
-        let snapStride = max(1, frameCount / maxSnapshots)
+        // Round the stride *up* so ≤ `maxSnapshots` layers span the whole clip. Rounding down
+        // (`frameCount / maxSnapshots`) gave stride 1 for any 96–191-frame clip, and the decode loop
+        // stops at `maxSnapshots` layers — so the preview only ever showed the first 96 frames (the
+        // bundled 180-frame demo: its first ~3 s of 6) while the export covered all of it.
+        let snapStride = max(1, (frameCount + maxSnapshots - 1) / maxSnapshots)
         let horizon = settings.motionHorizonFrames(fps: Double(reader.info.nominalFrameRate))
         let ringCapacity = 2 * horizon + 2
-        let flattener = PixelBufferFlattener(size: pSize, colorSpace: context.workingColorSpace ?? cs)
+        let flattener = PixelBufferFlattener.image(size: pSize)
         let extractor = SubjectLayerExtractor()
         // Ignore regions are cut out of every proxy layer (same keep-mask the engine multiplies
         // into its motion mask), so masked areas show no trails in the preview either.
@@ -216,12 +222,14 @@ final class TrailPreviewRenderer {
     /// Recomposite the selected snapshot subset for the current frequency, trail mode, fade and
     /// color style. Cheap; safe to call on every slider change.
     ///
-    /// Fade/color parity: the engine fades its age map by `ageDecay` per output frame, its colour-age
-    /// map by `gradientDecay`, and (for `.ageGradient`) replaces trail pixels with the colour-age-
-    /// mapped gradient. The preview shows the *final* frame, so each snapshot's ages there are
-    /// `decay^(framesSinceSnapshot)` — the fade age applied as a per-layer opacity (the engine's fade
-    /// blends the trail toward the backdrop by exactly that value), the colour age as a per-layer
-    /// tint along the settings' gradient endpoints.
+    /// Fade/color parity: the engine decays its fade and colour-age maps once per source frame
+    /// (`ageDecay(perFrameAt:)` / `gradientDecay(perFrameAt:)` at the source rate), and (for
+    /// `.ageGradient`) replaces trail pixels with the colour-age-mapped gradient. The preview shows
+    /// the *final* frame, so each snapshot's ages there are the closed forms
+    /// `fadeAge(afterSeconds:)` / `gradientAge(afterSeconds:)` of the seconds since it was left — the
+    /// fade age applied as a per-layer opacity (the engine's fade blends the trail toward the
+    /// backdrop by exactly that value), the colour age as a per-layer tint along the gradient. Both
+    /// sides work in seconds of video, so they agree at any source frame rate.
     func recompose(settings: RenderSettings) {
         recomposeTask?.cancel()
         let layers = self.layers
@@ -229,12 +237,11 @@ final class TrailPreviewRenderer {
         let rect = proxyRect
         let count = max(1, min(layers.count, settings.snapshotCount(durationSeconds: clipDurationSeconds)))
         let mode = settings.trailMode
-        let decay = settings.ageDecay
+        let fades = settings.fadeSeconds > 0
         let gradientTint = settings.colorStyle == .ageGradient
-        let colorDecay = settings.gradientDecay
         let oldest = settings.gradientOldest
         let newest = settings.gradientNewest
-        let framesPerSnapshot = settings.snapshotIntervalSeconds * Double(settings.outputFPS)
+        let secondsPerSnapshot = settings.snapshotIntervalSeconds
         // Frozen plate vs. live scene — the toggle is just which backdrop the layers sit over.
         let backdrop = settings.backgroundMode == .live ? (liveBackground ?? background) : background
 
@@ -242,20 +249,20 @@ final class TrailPreviewRenderer {
             let selected = Self.evenlySpaced(layers, count: count)
             var composite = backdrop
 
-            func styled(_ layer: CIImage, framesSinceSnapshot: Double) -> CIImage {
+            func styled(_ layer: CIImage, secondsSinceSnapshot: Double) -> CIImage {
                 var out = layer
                 if gradientTint {
-                    let colorAge = pow(colorDecay, framesSinceSnapshot)
+                    let colorAge = settings.gradientAge(afterSeconds: secondsSinceSnapshot)
                     out = Self.tinted(out, color: Self.gradientColor(colorAge, oldest: oldest, newest: newest))
                 }
                 var opacity = mode == .overlay ? 0.5 : 1.0
-                if decay < 1 { opacity *= pow(decay, framesSinceSnapshot) }
+                if fades { opacity *= settings.fadeAge(afterSeconds: secondsSinceSnapshot) }
                 if opacity < 1 { out = Self.scaledAlpha(out, opacity) }
                 return out
             }
 
             for (i, layer) in selected.enumerated() {
-                composite = styled(layer, framesSinceSnapshot: Double(selected.count - 1 - i) * framesPerSnapshot)
+                composite = styled(layer, secondsSinceSnapshot: Double(selected.count - 1 - i) * secondsPerSnapshot)
                     .composited(over: composite)
             }
             // Draw the final frame's subject on top — the engine shows the live subject on the last
@@ -318,8 +325,7 @@ final class TrailPreviewRenderer {
         try? FileManager.default.setAttributes([.modificationDate: Date()], ofItemAtPath: dir.path)
 
         let pRect = CGRect(x: 0, y: 0, width: meta.proxyW, height: meta.proxyH)
-        let cs = context.workingColorSpace ?? CGColorSpaceCreateDeviceRGB()
-        let flattener = PixelBufferFlattener(size: pRect.size, colorSpace: cs)
+        let flattener = PixelBufferFlattener.image(size: pRect.size)
 
         guard let bgImage = CIImage(contentsOf: dir.appendingPathComponent("background.png")),
               let liveImage = CIImage(contentsOf: dir.appendingPathComponent("livebackground.png")) else { return nil }

@@ -92,27 +92,38 @@ struct TrailRenderEngine {
         let outputRect = CGRect(origin: .zero, size: outputSize)
         let exportScale = outputSize.width / cropRect.size.width
 
+        // Real-time output (§23: 30 fps default). Every source frame is still processed — detection,
+        // trail persistence and decay keep full temporal resolution — but a source faster than the
+        // `outputFPS` cap is decimated by a whole-frame stride (60 → 30, 120 → 30, 50 → 25) and a
+        // slower one keeps its own rate (24 stays 24). Writing every source frame at a fixed 30 fps
+        // made 60 fps captures export at half speed and 24 fps imports play 25% fast.
+        let sourceFPS = Double(info.nominalFrameRate)
+        let outputStride = settings.outputFrameStride(sourceFPS: sourceFPS)
+        let outputFrameRate = settings.outputFrameRate(sourceFPS: sourceFPS)
+
         let outputURL = FileManager.default.temporaryDirectory
             .appendingPathComponent("trail-\(UUID().uuidString).mp4")
         // Only a completed render hands `outputURL` back to the caller; on a throw or cancellation
         // nobody else can reclaim the partial temp file, so drop it here.
         var renderSucceeded = false
         defer { if !renderSucceeded { try? FileManager.default.removeItem(at: outputURL) } }
-        let writer = try VideoFrameWriter(outputURL: outputURL, size: outputSize, frameRate: settings.outputFPS)
+        let writer = try VideoFrameWriter(outputURL: outputURL, size: outputSize, frameRate: outputFrameRate)
 
         try reader.start()
         try writer.start()
 
         let context = SharedRender.ciContext
-        let workingColorSpace = context.workingColorSpace ?? CGColorSpaceCreateDeviceRGB()
-        let flattener = PixelBufferFlattener(size: fullSize, colorSpace: workingColorSpace)
+        // Pictures (accumulators) are stored sRGB-encoded 8-bit; the age maps, which are decayed and
+        // re-flattened every frame, in linear half-float — see `PixelBufferFlattener` for why each
+        // needs its own storage (8-bit linear banded shadows; 8-bit age maps froze long fades).
+        let flattener = PixelBufferFlattener.image(size: fullSize)
+        let ageFlattener = PixelBufferFlattener.scalar(size: fullSize)
         // Independent pool for the ±K look-ahead ring buffer: each decoded frame is rendered into its
         // own GPU buffer so it survives across loop iterations (the reader vends recycled sample
         // buffers) without contending with the accumulator's flatten pool.
-        let frameFlattener = PixelBufferFlattener(size: fullSize, colorSpace: workingColorSpace)
+        let frameFlattener = PixelBufferFlattener.image(size: fullSize)
         // Small dedicated pool for the mask-resolution proxy the window keeps per frame.
-        let maskFlattener = masksDownscaled
-            ? PixelBufferFlattener(size: maskSize, colorSpace: workingColorSpace) : nil
+        let maskFlattener = masksDownscaled ? PixelBufferFlattener.image(size: maskSize) : nil
         let maskBuilder = MotionMaskBuilder()
         let compositor = TrailCompositor()
         let colorizer = settings.colorStyle == .ageGradient
@@ -130,8 +141,11 @@ struct TrailRenderEngine {
             progress?(fraction * Self.analyzingShare)
         }
         stage?(.rendering)
-        let decay = settings.ageDecay
-        let colorDecay = settings.gradientDecay
+        // Fade / colour-age decay per *source* frame: decay steps once per decoded frame (the output
+        // may be a decimated subset of them), so "faded out in N seconds" holds in real time at any
+        // source rate — and matches the preview's closed-form `fadeAge(afterSeconds:)`.
+        let decay = settings.ageDecay(perFrameAt: sourceFPS)
+        let colorDecay = settings.gradientDecay(perFrameAt: sourceFPS)
         // Display backdrop: trails composite over the frozen plate, or over the live current frame.
         let liveBackdrop = settings.backgroundMode == .live
         // Simulated handheld motion re-projects the *final* composited frame (display only —
@@ -141,11 +155,11 @@ struct TrailRenderEngine {
         // Depth parallax: large (≈ nearer) marks are accumulated on their own transparent plane,
         // which the handheld pose translates slightly more than the scene (see HandheldMotion).
         let parallaxOn = handheld != nil && settings.handheldParallax
-        let outputFPS = Double(settings.outputFPS)
+        let outputFPS = Double(outputFrameRate)
 
         // Detection horizon K (frames): each frame is differenced against the frames ±K away. Slow
         // drift (clouds, swaying foliage) is unchanged over ±K and cancels; fast subjects survive.
-        let horizon = settings.motionHorizonFrames(fps: Double(info.nominalFrameRate))
+        let horizon = settings.motionHorizonFrames(fps: sourceFPS)
         let darkLumaCutoff = 0.06
 
         let registrar = settings.stabilizationEnabled ? FrameRegistrar(reference: staticBackground) : nil
@@ -211,9 +225,11 @@ struct TrailRenderEngine {
         var firstIndex = 0          // global index of window[0]
         var nextToProcess = 0       // global index of the next centre to emit
 
-        // Build the output buffer for centre frame `centre` (nil = skip a leading dark fade-in). The
-        // heavy Core Image work runs in an autoreleasepool so transient Metal textures/IOSurfaces are
-        // reclaimed every frame; the encode-side `append` is awaited *outside* the pool by `emit`.
+        // Advance the trail state by centre frame `centre` and build its output buffer — nil when the
+        // frame is a skipped leading dark fade-in, or is processed (detection, persistence, decay)
+        // but decimated out of the real-time output. The heavy Core Image work runs in an
+        // autoreleasepool so transient Metal textures/IOSurfaces are reclaimed every frame; the
+        // encode-side `append` is awaited *outside* the pool by `emit`.
         func renderCentre(_ centre: Int) throws -> CVPixelBuffer? {
             try autoreleasepool {
                 let rec = window[centre - firstIndex]
@@ -222,6 +238,10 @@ struct TrailRenderEngine {
                     sawBright = true
                 }
                 defer { processedIndex += 1 }
+                // Real-time output keeps every `outputStride`-th processed frame (stride 1 unless the
+                // source is faster than the output cap). The export graph below is lazy, so a
+                // decimated frame costs only its state updates — it is never rendered.
+                let writesOutput = processedIndex % outputStride == 0
                 // ~`snapshotCount` evenly-spaced frames leave a permanent mark.
                 let isSnapshot = processedIndex == 0 ||
                     Int(Double(processedIndex) * Double(snapshotCount) / Double(total)) >
@@ -269,18 +289,20 @@ struct TrailRenderEngine {
                 switch output {
                 case .trail:
                     // Fade the persistent trail every frame for smooth decay.
+                    // Age maps live in half-float (`ageFlattener`): at 8 bits this per-frame decay
+                    // stalled once `round(q · decay) == q`, freezing long fades at a visible residual.
                     if decay < 1 {
-                        ageMap = flattener.flatten(scaleGray(ageMap, decay), rect: fullRect, context: context)
+                        ageMap = ageFlattener.flatten(scaleGray(ageMap, decay), rect: fullRect, context: context)
                         for i in nearPlanes.indices {
-                            nearPlanes[i].ageMap = flattener.flatten(scaleGray(nearPlanes[i].ageMap, decay),
-                                                                     rect: fullRect, context: context)
+                            nearPlanes[i].ageMap = ageFlattener.flatten(scaleGray(nearPlanes[i].ageMap, decay),
+                                                                        rect: fullRect, context: context)
                         }
                     }
                     if colorizer != nil, colorDecay < 1 {
-                        colorAgeMap = flattener.flatten(scaleGray(colorAgeMap, colorDecay), rect: fullRect, context: context)
+                        colorAgeMap = ageFlattener.flatten(scaleGray(colorAgeMap, colorDecay), rect: fullRect, context: context)
                         for i in nearPlanes.indices {
-                            nearPlanes[i].colorAgeMap = flattener.flatten(scaleGray(nearPlanes[i].colorAgeMap, colorDecay),
-                                                                          rect: fullRect, context: context)
+                            nearPlanes[i].colorAgeMap = ageFlattener.flatten(scaleGray(nearPlanes[i].colorAgeMap, colorDecay),
+                                                                             rect: fullRect, context: context)
                         }
                     }
 
@@ -364,15 +386,15 @@ struct TrailRenderEngine {
                     // Persist the silhouette only at snapshot frames.
                     if isSnapshot {
                         accumulator = flattener.flatten(displayAccumulator, rect: fullRect, context: context)
-                        ageMap = flattener.flatten(displayAgeMap, rect: fullRect, context: context)
+                        ageMap = ageFlattener.flatten(displayAgeMap, rect: fullRect, context: context)
                         if colorizer != nil {
-                            colorAgeMap = flattener.flatten(displayColorAgeMap, rect: fullRect, context: context)
+                            colorAgeMap = ageFlattener.flatten(displayColorAgeMap, rect: fullRect, context: context)
                         }
                         for (i, planeDisplay) in planeDisplays.enumerated() {
                             nearPlanes[i].accumulator = flattener.flatten(planeDisplay.accumulator, rect: fullRect, context: context)
-                            nearPlanes[i].ageMap = flattener.flatten(planeDisplay.ageMap, rect: fullRect, context: context)
+                            nearPlanes[i].ageMap = ageFlattener.flatten(planeDisplay.ageMap, rect: fullRect, context: context)
                             if colorizer != nil {
-                                nearPlanes[i].colorAgeMap = flattener.flatten(planeDisplay.colorAgeMap, rect: fullRect, context: context)
+                                nearPlanes[i].colorAgeMap = ageFlattener.flatten(planeDisplay.colorAgeMap, rect: fullRect, context: context)
                             }
                         }
                     }
@@ -381,6 +403,7 @@ struct TrailRenderEngine {
                                                 scale: exportScale, outputRect: outputRect)
                 }
 
+                guard writesOutput else { return nil }
                 return try writer.makeFrameBuffer(exportFrame, context: context)
             }
         }
@@ -390,8 +413,10 @@ struct TrailRenderEngine {
             if let frameBuffer = try renderCentre(centre) {
                 try await writer.append(frameBuffer)
                 written += 1
-                progress?(Self.analyzingShare + (1 - Self.analyzingShare) * min(1, Double(written) / Double(total)))
             }
+            // Progress counts source frames consumed, not frames written — with decimation the
+            // written count tops out at a fraction of `total`.
+            progress?(Self.analyzingShare + (1 - Self.analyzingShare) * min(1, Double(centre + 1) / Double(total)))
             // Later centres only need this frame's proxy (as a ±K neighbour) — release the full-res
             // image now rather than when the frame leaves the window.
             window[centre - firstIndex].image = nil

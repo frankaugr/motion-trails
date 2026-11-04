@@ -42,7 +42,9 @@ struct RenderSettings: Equatable, Hashable, Codable {
     /// trail (spec §7.5). Higher = more frequent snapshots = denser trail; lower spaces them out.
     var trailFrequency: Double = 1.0
 
-    /// Output frame rate (spec §23 default 30).
+    /// Output frame-rate **cap** (spec §23 default 30). Exports always play in real time: a faster
+    /// source is decimated by a whole-frame stride to at most this rate, a slower one keeps its own
+    /// (see `outputFrameStride(sourceFPS:)`). Persisted under the historical `outputFPS` key.
     var outputFPS: Int = 30
 
     // MARK: - Creative effects (spec §8)
@@ -60,7 +62,7 @@ struct RenderSettings: Equatable, Hashable, Codable {
     /// Seconds after a mark is left until its hue has shifted from `gradientNewest` to
     /// `gradientOldest` (`colorStyle == .ageGradient` only). Surfaced as the gradient-speed slider,
     /// 0.5…10 s. Deliberately independent of `fadeSeconds`: the colour age decays at its own rate
-    /// (`gradientDecay`), so the hue can sweep while the trail itself stays fully opaque.
+    /// (`gradientDecay(perFrameAt:)`), so the hue can sweep while the trail itself stays fully opaque.
     var gradientShiftSeconds: Double = 2.0
 
     /// Age-gradient endpoints: a fresh mark appears as `gradientNewest` and shifts toward
@@ -296,19 +298,55 @@ struct RenderSettings: Equatable, Hashable, Codable {
     private static let agedOutCutoff = 0.05
 
     /// The per-frame multiplier that takes an age from 1 down to `agedOutCutoff` over `seconds`
-    /// of output. ≤ 0 seconds means no decay (1.0).
-    static func decay(overSeconds seconds: Double, fps: Int) -> Double {
+    /// of video, for a frame stream at `fps`. ≤ 0 seconds means no decay (1.0).
+    static func decay(overSeconds seconds: Double, fps: Double) -> Double {
         guard seconds > 0 else { return 1 }
-        return pow(agedOutCutoff, 1.0 / (Double(max(1, fps)) * seconds))
+        return pow(agedOutCutoff, 1.0 / (max(1, fps) * seconds))
     }
 
-    /// Per-frame multiplier applied to the age map. 1.0 = persistent (no fade); lower fades faster.
-    var ageDecay: Double { Self.decay(overSeconds: fadeSeconds, fps: outputFPS) }
+    /// Closed form of an age after `seconds`: `decay^(fps · seconds)` for any fps. The engine steps
+    /// `decay(overSeconds:fps:)` once per source frame; the live preview evaluates this directly per
+    /// snapshot layer — both expressed in seconds of video, so they agree at any frame rate.
+    private static func age(afterSeconds elapsed: Double, overSeconds seconds: Double) -> Double {
+        guard seconds > 0 else { return 1 }
+        return pow(agedOutCutoff, max(0, elapsed) / seconds)
+    }
 
-    /// Per-frame multiplier for the **colour** age map (gradient mode). Separate from `ageDecay` so
-    /// the hue sweep is independent of the fade (the old behaviour reused the fade decay, which made
-    /// the gradient a flat colour whenever fade was 0).
-    var gradientDecay: Double { Self.decay(overSeconds: gradientShiftSeconds, fps: outputFPS) }
+    /// Per-frame multiplier for the fade age map at `fps` frames per second of video (the engine
+    /// passes the **source** rate — it decays once per decoded frame). 1.0 = persistent (no fade).
+    func ageDecay(perFrameAt fps: Double) -> Double { Self.decay(overSeconds: fadeSeconds, fps: fps) }
+
+    /// Per-frame multiplier for the **colour** age map (gradient mode). Separate from the fade so
+    /// the hue sweep is independent of it (the old behaviour reused the fade decay, which made the
+    /// gradient a flat colour whenever fade was 0).
+    func gradientDecay(perFrameAt fps: Double) -> Double { Self.decay(overSeconds: gradientShiftSeconds, fps: fps) }
+
+    /// Fade age (1 = fresh) of a mark left `seconds` ago — the opacity the engine's age map gives it.
+    func fadeAge(afterSeconds seconds: Double) -> Double {
+        Self.age(afterSeconds: seconds, overSeconds: fadeSeconds)
+    }
+
+    /// Colour age (1 = newest colour) of a mark left `seconds` ago, in gradient mode.
+    func gradientAge(afterSeconds seconds: Double) -> Double {
+        Self.age(afterSeconds: seconds, overSeconds: gradientShiftSeconds)
+    }
+
+    // MARK: - Output timing
+
+    /// Whole-frame decimation stride that keeps an export real-time at no more than `outputFPS`:
+    /// 1 for sources at or below the cap (24/25/30 fps keep every frame and their own rate), 2 for
+    /// 50/60 fps, 4 for 120, 8 for 240. A whole stride (not nearest-frame resampling) keeps the
+    /// output cadence even. 5% slack keeps a nominal 30.5 fps (variable-rate) clip at stride 1.
+    func outputFrameStride(sourceFPS: Double) -> Int {
+        let cap = Double(max(1, outputFPS))
+        return max(1, Int((max(1, sourceFPS) / (cap * 1.05)).rounded(.up)))
+    }
+
+    /// Frame rate the export is written at for a source at `sourceFPS`: the source rate divided by
+    /// `outputFrameStride(sourceFPS:)`, so the output plays in real time (60 → 30, 50 → 25, 24 → 24).
+    func outputFrameRate(sourceFPS: Double) -> Int {
+        max(1, Int((max(1, sourceFPS) / Double(outputFrameStride(sourceFPS: sourceFPS))).rounded()))
+    }
 
     /// Persistent trail snapshots per **second of source**, derived from the 0…1 `trailFrequency`
     /// (spec §7.5). Time-based on purpose: the old model spread a fixed count across the whole clip,

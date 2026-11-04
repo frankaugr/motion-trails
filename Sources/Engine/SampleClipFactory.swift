@@ -39,7 +39,7 @@ struct SampleClipFactory {
 
         let context = SharedRender.ciContext
         let rect = CGRect(origin: .zero, size: size)
-        let flattener = PixelBufferFlattener(size: size, colorSpace: context.workingColorSpace ?? CGColorSpaceCreateDeviceRGB())
+        let flattener = PixelBufferFlattener.image(size: size)   // sRGB-encoded: no banding in the sky gradient
         let sky = flattener.flatten(makeSky(rect: rect), rect: rect, context: context)
 
         let frameCount = Int(durationSeconds * Double(fps))

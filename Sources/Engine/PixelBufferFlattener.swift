@@ -12,17 +12,45 @@ import CoreVideo
 /// GPU (zero-copy via IOSurface) and recycles buffers, eliminating the readback and the per-frame
 /// allocation churn. This mirrors what `VideoFrameWriter` already does for the encode path.
 ///
-/// The render and the returned image both use the supplied color space (the engine passes its
-/// context's working color space) so repeatedly feeding the flattened accumulator back in is a
-/// color-space identity and the trail can't drift over hundreds of frames.
+/// **Pick the storage by what the buffer holds** — use the `image` / `scalar` factories rather than
+/// the raw initializer:
+/// - `image(size:)` — 8-bit BGRA, **sRGB-encoded**. For pictures: decoded frames, mask proxies,
+///   trail accumulators, preview layers. 8 bits must be gamma-encoded: Core Image's working space
+///   is *linear*, and 8-bit linear storage leaves the darkest fifth of the tonal range only ~9
+///   levels (vs 51), posterizing shadows in every flattened frame.
+/// - `scalar(size:)` — 16-bit **half-float**, linear. For per-pixel numeric maps that are decayed
+///   and re-flattened every frame (the fade / colour age maps). At 8 bits, `round(q · decay) == q`
+///   once `q < 0.5 / (1 − decay)`, so a long fade froze at a permanent residual (≈20% opacity for
+///   a 10 s fade at 30 fps) instead of reaching zero; half-float keeps decaying exactly.
+///
+/// The render and the returned image use the same color space, so repeatedly feeding a flattened
+/// buffer back in is a round-trip identity (encode∘decode returns the same 8-bit code) and the
+/// trail can't drift over hundreds of frames.
 final class PixelBufferFlattener {
     private let colorSpace: CGColorSpace
     private let pool: CVPixelBufferPool?
 
-    init(size: CGSize, colorSpace: CGColorSpace) {
+    /// Gamma-encoded 8-bit colour storage (frames, proxies, accumulators, preview layers).
+    static func image(size: CGSize) -> PixelBufferFlattener {
+        PixelBufferFlattener(size: size,
+                             colorSpace: CGColorSpace(name: CGColorSpace.sRGB) ?? CGColorSpaceCreateDeviceRGB(),
+                             pixelFormat: kCVPixelFormatType_32BGRA)
+    }
+
+    /// Linear half-float storage for scalar maps re-flattened every frame (fade / colour age).
+    /// Uses the shared context's working space, so the flatten is a colour-space identity.
+    static func scalar(size: CGSize) -> PixelBufferFlattener {
+        let linear = SharedRender.ciContext.workingColorSpace
+            ?? CGColorSpace(name: CGColorSpace.extendedLinearSRGB)
+            ?? CGColorSpaceCreateDeviceRGB()
+        return PixelBufferFlattener(size: size, colorSpace: linear,
+                                    pixelFormat: kCVPixelFormatType_64RGBAHalf)
+    }
+
+    init(size: CGSize, colorSpace: CGColorSpace, pixelFormat: OSType = kCVPixelFormatType_32BGRA) {
         self.colorSpace = colorSpace
         let attributes: [String: Any] = [
-            kCVPixelBufferPixelFormatTypeKey as String: kCVPixelFormatType_32BGRA,
+            kCVPixelBufferPixelFormatTypeKey as String: pixelFormat,
             kCVPixelBufferWidthKey as String: Int(size.width),
             kCVPixelBufferHeightKey as String: Int(size.height),
             kCVPixelBufferMetalCompatibilityKey as String: true,
