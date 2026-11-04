@@ -197,11 +197,16 @@ func run() async throws {
     print("       max static-region drift first→last frame: \(maxDrift)/255")
     check(maxDrift <= 6, "no color drift in static region across the whole render (≤6/255)")
 
-    // Trail persistence: a pixel in the square's early path (left side, mid band) should be bright
-    // in the last frame — the silhouette was stamped into the trail and never overwritten.
-    let (tr, tg, tb) = pixel(lastBuf, 20, H / 2)
-    let (br, bg2, bb) = pixel(lastBuf, 20, staticY)   // background at the same column
-    print("       trail pixel (20,\(H/2)) = (\(tr),\(tg),\(tb)) vs background = (\(br),\(bg2),\(bb))")
+    // Trail persistence: a pixel on the square's mid path (centre of the mid band) should be bright
+    // in the last frame — the silhouette was stamped into the trail and never overwritten. Probe
+    // mid-path, not the path's start: temporal detection deliberately tapers off over the first ~K
+    // frames (the ±K pair shrinks toward the clip edge and is used both-or-nothing), so with K = 8
+    // the square's opening positions (x < ~40) never enter the trail. The old x = 20 probe predated
+    // temporal detection and had been failing since it landed.
+    let trailX = W / 2
+    let (tr, tg, tb) = pixel(lastBuf, trailX, H / 2)
+    let (br, bg2, bb) = pixel(lastBuf, trailX, staticY)   // background at the same column
+    print("       trail pixel (\(trailX),\(H/2)) = (\(tr),\(tg),\(tb)) vs background = (\(br),\(bg2),\(bb))")
     check(tr + tg + tb > (br + bg2 + bb) + 80, "trail silhouette persisted (brighter than background)")
 
     // ---- Test 3: render with fade on (exercises per-frame ageMap flatten path) ----
