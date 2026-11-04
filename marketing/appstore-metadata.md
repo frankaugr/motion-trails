@@ -4,13 +4,14 @@ Copy/paste into App Store Connect. Counts are within Apple's limits (checked wit
 Connect counts characters the same way). The app is a **one-time paid download with every effect
 included** — never say "free" anywhere in the listing.
 
-## Name (≤30) — 13/30
+## Name (≤30) — 12/30
 
-Motion Trails
+MotionTrails
 
-> Option worth A/B-ing once live (name is the heaviest-weighted search field): `Motion Trails – Long
-> Exposure` (29/30). If you use it, move "Daylight" / "effect" terms into the subtitle instead, e.g.
-> `Daylight motion blur, no filter` (29) — don't repeat "long exposure" in both.
+> **One word, by decision (Frank, 2026-11-04) — don't change it.** The in-app display name and all
+> marketing copy still read "Motion Trails"; only the App Store name is the single token. Because
+> search treats `MotionTrails` as one word, the subtitle and keywords carry the "motion"/"trails"
+> vocabulary indirectly ("long exposure", "effect", "blur", "flock"…).
 
 ## Subtitle (≤30) — 29/30
 
@@ -68,7 +69,14 @@ Best with a fixed camera and a fast subject: birds and flocks, cyclists and runn
 
 Turn motion into trails.
 
-## What's New (version 1.0.0)
+## What's New (version 1.1) — 1.0.1 is live; 1.1 ships the engine fixes + the new listing
+
+• Exports now play in real time: 60 fps captures no longer run at half speed, and 24 fps imports keep their pace.
+• Long fades now melt all the way out instead of leaving a faint residual.
+• Smoother shadows and sky gradients — no more banding in dark areas.
+• The live preview now covers the whole clip, not just the first few seconds.
+
+## What's New (version 1.0.0, as shipped)
 
 Motion Trails is here. Turn a few seconds of locked-off video into a daylight long exposure — birds, cyclists, traffic and waves leave trails over a perfectly still scene. Tune density, speed, fade and colour on a live preview, then export a loop-ready video. Every effect included.
 

@@ -1,4 +1,10 @@
-# App Review response — Guideline 2.1 (Information Needed)
+# App Review notes
+
+> **Status (2026-11-04):** 1.0.1 (build 2) is approved and live ("Ready for Distribution"). The 2.1
+> "Information Needed" round below is resolved; section B stays as the reusable App Review
+> Information → Notes text for every future version (1.1 is being prepared in App Store Connect).
+
+## (Historical) App Review response — Guideline 2.1 (Information Needed)
 
 Two parts: (A) a screen recording you capture and attach in your **reply in App Store Connect**, and
 (B) the text below, pasted into **App Store Connect → App Review Information → Notes** (also reusable
