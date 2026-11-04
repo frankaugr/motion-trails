@@ -21,7 +21,8 @@ Build (scheme `MotionTrails`):
 ```sh
 # Compile-check for a device without signing/simulator
 xcodebuild -project MotionTrails.xcodeproj -scheme MotionTrails \
-  -destination 'generic/platform=iOS' -configuration Debug build
+  -destination 'generic/platform=iOS' -configuration Debug build \
+  CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO
 
 # Run in the simulator (iOS 26 runtimes are installed)
 xcodebuild -project MotionTrails.xcodeproj -scheme MotionTrails \
